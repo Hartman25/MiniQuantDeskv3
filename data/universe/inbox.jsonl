@@ -1,0 +1,5 @@
+# Scanner writes candidate symbols here (one JSON object per line)
+# Format: {"id": "...", "ts": "...", "symbol": "...", "score": ..., "features": {...}, "levels": {...}}
+{"id": "2026-01-26T05:15:39.595354Z:TSLA:scanner_v2", "ts": "2026-01-26T05:15:39.595354Z", "symbol": "TSLA", "session": "rth", "score": 8.5, "features": {"rvol": 3.2, "gap_pct": 5.1, "spread_bps": 8, "dollar_vol": 15000000, "atr_pct": 2.5}, "levels": {"hold": 245.0, "break": 250.0, "t1": 260.0, "t2": 275.0}, "source": "scanner_v2", "version": "2.1"}
+{"id": "2026-01-26T05:15:39.595664Z:NVDA:scanner_v2", "ts": "2026-01-26T05:15:39.595664Z", "symbol": "NVDA", "session": "rth", "score": 7.8, "features": {"rvol": 2.8, "spread_bps": 6, "dollar_vol": 20000000, "atr_pct": 3.0}, "levels": {"hold": 520.0, "break": 525.0, "t1": 540.0, "t2": 560.0}, "source": "scanner_v2", "version": "2.1"}
+{"id": "2026-01-26T05:15:39.596059Z:AAPL:scanner_v2", "ts": "2026-01-26T05:15:39.596059Z", "symbol": "AAPL", "session": "rth", "score": 6.2, "features": {"rvol": 1.5, "spread_bps": 85, "dollar_vol": 30000000}, "levels": {"hold": 185.0}, "source": "scanner_v2", "version": "2.1"}

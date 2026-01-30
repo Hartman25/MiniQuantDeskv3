@@ -1,0 +1,7 @@
+requests>=2.31.0
+python-dotenv>=1.0.0
+tzdata>=2024.1
+# Optional for Patch 22 baseline model:
+# numpy>=1.26
+# scikit-learn>=1.4
+# joblib>=1.3

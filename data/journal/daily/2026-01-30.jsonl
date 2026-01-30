@@ -1,0 +1,8 @@
+{"event": "boot", "mode": "live", "paper": false, "ts": "2026-01-30T02:57:22.645399+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "runtime_error", "error": "[<class 'decimal.ConversionSyntax'>]", "ts": "2026-01-30T02:57:22.649825+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "boot", "mode": "live", "paper": false, "ts": "2026-01-30T02:58:30.483458+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "runtime_error", "error": "[<class 'decimal.ConversionSyntax'>]", "ts": "2026-01-30T02:58:30.484460+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "runtime_error", "error": "[<class 'decimal.ConversionSyntax'>]", "ts": "2026-01-30T02:59:30.486674+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "runtime_error", "error": "[<class 'decimal.ConversionSyntax'>]", "ts": "2026-01-30T03:00:30.490635+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "boot", "mode": "live", "paper": false, "ts": "2026-01-30T03:11:11.032661+00:00", "day": "2026-01-30", "month": "2026-01"}
+{"event": "boot", "mode": "live", "paper": false, "ts": "2026-01-30T03:14:55.313550+00:00", "day": "2026-01-30", "month": "2026-01"}

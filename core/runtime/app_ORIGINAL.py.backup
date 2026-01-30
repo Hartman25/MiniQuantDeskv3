@@ -1,0 +1,428 @@
+"""
+Runtime Application - Main trading loop for paper and live trading.
+
+ARCHITECTURE:
+- Single unified runner for both paper and live modes
+- Event-driven with configurable cycle interval
+- Loads strategies from config
+- Enforces data validation (anti-lookahead)
+- Routes signals through risk gate
+- Handles graceful shutdown
+
+Based on LEAN's Algorithm.Run() with enhanced safety.
+"""
+
+from __future__ import annotations
+
+import signal
+import time
+import uuid
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+from core.di.container import Container
+from core.brokers import AlpacaBrokerConnector, BrokerOrderSide
+from core.execution.engine import OrderExecutionEngine
+from core.data.contract import MarketDataContract
+from core.logging import get_logger, LogStream
+
+
+logger = get_logger(LogStream.SYSTEM)
+
+
+@dataclass
+class RunOptions:
+    config_path: Path
+    mode: str  # "paper" or "live"
+    run_once: bool = False
+    cycle_seconds: Optional[int] = None  # override config if provided
+
+
+@dataclass
+class _RunState:
+    running: bool = True
+    error_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Strategy Registry Bootstrap
+# ---------------------------------------------------------------------------
+
+def _ensure_strategy_registry_bootstrapped(container: Container) -> None:
+    """
+    Register built-in strategies into StrategyRegistry.
+    
+    Strategies must be registered before instantiation from config.
+    Registry uses class.__name__ as the key.
+    """
+    registry = container.get_strategy_registry()
+    
+    # Register VWAP mean reversion strategy
+    try:
+        from strategies.vwap_mean_reversion import VWAPMeanReversion
+        registry.register(VWAPMeanReversion)
+    except ValueError:
+        # Already registered
+        pass
+    except Exception as e:
+        raise RuntimeError(f"Failed to import/register VWAPMeanReversion: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Data Conversion
+# ---------------------------------------------------------------------------
+
+def _df_to_contracts(symbol: str, df: pd.DataFrame) -> List[MarketDataContract]:
+    """
+    Convert DataFrame of bars → list[MarketDataContract].
+    
+    Expectations:
+    - columns include: open, high, low, close, volume (volume optional)
+    - timestamp either index or a column like timestamp/time
+    - timestamps must be tz-aware UTC for MarketDataContract
+    """
+    if df is None or df.empty:
+        raise ValueError(f"No bars returned for {symbol}")
+    
+    # Determine timestamp source
+    ts_series = None
+    if isinstance(df.index, pd.DatetimeIndex):
+        ts_series = df.index
+    else:
+        for col in ("timestamp", "time", "t", "datetime"):
+            if col in df.columns:
+                ts_series = pd.to_datetime(df[col])
+                break
+    
+    if ts_series is None:
+        raise ValueError(f"Cannot determine timestamps for {symbol} bars")
+    
+    def _as_utc(ts) -> pd.Timestamp:
+        t = pd.Timestamp(ts)
+        if t.tzinfo is None:
+            t = t.tz_localize("UTC")
+        else:
+            t = t.tz_convert("UTC")
+        return t
+    
+    bars: List[MarketDataContract] = []
+    for i in range(len(df)):
+        row = df.iloc[i]
+        ts = _as_utc(ts_series[i])
+        
+        def _d(x) -> Decimal:
+            return Decimal(str(x))
+        
+        vol = None
+        if "volume" in df.columns:
+            try:
+                vol = int(row["volume"])
+            except Exception:
+                vol = None
+        
+        bars.append(
+            MarketDataContract(
+                symbol=symbol,
+                timestamp=ts.to_pydatetime(),
+                open=_d(row["open"]),
+                high=_d(row["high"]),
+                low=_d(row["low"]),
+                close=_d(row["close"]),
+                volume=vol,
+                provider="pipeline"
+            )
+        )
+    return bars
+
+
+# ---------------------------------------------------------------------------
+# App Runner
+# ---------------------------------------------------------------------------
+
+def run_app(opts: RunOptions) -> int:
+    """
+    Shared runner for paper/live trading.
+    
+    CRITICAL FLOW:
+    1. Load config and initialize container
+    2. Connect to broker
+    3. Register strategies
+    4. Run startup reconciliation (MANDATORY)
+    5. Enter main trading loop:
+       - Fetch market data
+       - Validate data (staleness, completion)
+       - Route to strategies
+       - Collect signals
+       - Validate through risk gate
+       - Submit orders to broker
+    6. Graceful shutdown on SIGINT/SIGTERM
+    """
+    if opts.mode not in ("paper", "live"):
+        raise ValueError("mode must be 'paper' or 'live'")
+    
+    state = _RunState()
+    
+    def _handle_sig(_signum, _frame):
+        state.running = False
+    
+    signal.signal(signal.SIGINT, _handle_sig)
+    signal.signal(signal.SIGTERM, _handle_sig)
+    
+    # ========================================================================
+    # INITIALIZATION
+    # ========================================================================
+    
+    container = Container()
+    container.initialize(str(opts.config_path))
+    cfg = container.get_config()
+    
+    paper = opts.mode == "paper"
+    cfg.broker.paper_trading = paper
+    
+    broker = AlpacaBrokerConnector(
+        api_key=cfg.broker.api_key,
+        api_secret=cfg.broker.api_secret,
+        paper=paper,
+    )
+    container.set_broker_connector(broker)
+    
+    # Register strategies
+    _ensure_strategy_registry_bootstrapped(container)
+    
+    # Start services
+    container.start()
+    
+    # ========================================================================
+    # STARTUP RECONCILIATION (MANDATORY)
+    # ========================================================================
+    
+    reconciler = container.get_reconciler()
+    if reconciler:
+        try:
+            discrepancies = reconciler.reconcile_startup()
+            if discrepancies:
+                logger.warning(
+                    "Startup reconciliation found discrepancies",
+                    extra={"count": len(discrepancies), "mode": opts.mode}
+                )
+                # TODO Patch 3: Add hard-gate if critical discrepancies
+        except Exception as e:
+            state.error_count += 1
+            logger.error(
+                "Startup reconciliation failed",
+                extra={"error": str(e)},
+                exc_info=True
+            )
+            # TODO Patch 3: Make this STOP-SHIP for live mode
+    
+    # ========================================================================
+    # BUILD EXECUTION PIPELINE
+    # ========================================================================
+    
+    exec_engine = OrderExecutionEngine(
+        broker=broker,
+        state_machine=container.get_order_machine(),
+        position_store=container.get_position_store()
+    )
+    
+    lifecycle = container.get_strategy_lifecycle()
+    registry = container.get_strategy_registry()
+    
+    # Instantiate enabled strategies from config
+    enabled_strategies: Dict[str, tuple] = {}
+    for s_cfg in cfg.strategies:
+        if not getattr(s_cfg, "enabled", True):
+            continue
+        
+        symbols = list(getattr(s_cfg, "symbols", []) or [])
+        timeframe = getattr(s_cfg, "timeframe", "1Min")
+        lookback = int(getattr(s_cfg, "lookback_bars", 200))
+        params = dict(getattr(s_cfg, "parameters", {}) or {})
+        
+        # Create strategy instance
+        strategy = registry.create(
+            name=s_cfg.name,
+            config=params,
+            symbols=symbols,
+            timeframe=timeframe,
+        )
+        
+        lifecycle.add_strategy(strategy)
+        lifecycle.start_strategy(strategy.name)
+        
+        enabled_strategies[strategy.name] = (symbols, timeframe, lookback, params)
+    
+    if not enabled_strategies:
+        raise RuntimeError("No enabled strategies in config")
+    
+    data_pipeline = container.get_data_pipeline()
+    data_validator = container.get_data_validator()
+    risk_mgr = container.get_risk_manager()
+    
+    cycle = int(opts.cycle_seconds or getattr(cfg.session, "cycle_interval_seconds", 60) or 60)
+    cycle = max(1, cycle)
+    
+    all_symbols = sorted(set(
+        sum([v[0] for v in enabled_strategies.values()], [])
+    ))
+    
+    logger.info(
+        "Runner started",
+        extra={
+            "mode": opts.mode,
+            "symbols": all_symbols,
+            "strategies": list(enabled_strategies.keys()),
+            "cycle_seconds": cycle,
+            "run_once": opts.run_once,
+        }
+    )
+    
+    # ========================================================================
+    # MAIN TRADING LOOP
+    # ========================================================================
+    
+    while state.running:
+        try:
+            # Get account info
+            acct = broker.get_account_info()
+            account_value = Decimal(str(acct.get("portfolio_value", "0")))
+            buying_power = Decimal(str(acct.get("buying_power", "0")))
+            
+            for symbol in all_symbols:
+                # Determine timeframe/lookback from first strategy using this symbol
+                timeframe = "1Min"
+                lookback = 200
+                for _, (symbols, tf, lb, _) in enabled_strategies.items():
+                    if symbol in symbols:
+                        timeframe, lookback = tf, lb
+                        break
+                
+                # Fetch bars
+                df = data_pipeline.get_latest_bars(
+                    symbol=symbol,
+                    lookback_bars=lookback,
+                    timeframe=timeframe
+                )
+                bars = _df_to_contracts(symbol, df)
+                
+                # ============================================================
+                # CRITICAL: VALIDATE BARS (anti-lookahead)
+                # ============================================================
+                data_validator.validate_bars(bars=bars, timeframe=timeframe)
+                
+                # Only use the latest COMPLETE bar
+                # (DataValidator already checked completion, but be explicit)
+                bar = bars[-1]
+                if not bar.is_complete(timeframe):
+                    logger.debug(
+                        f"Skipping incomplete bar for {symbol}",
+                        extra={"bar_timestamp": bar.timestamp, "timeframe": timeframe}
+                    )
+                    continue
+                
+                # ============================================================
+                # ROUTE TO STRATEGIES
+                # ============================================================
+                signals = lifecycle.on_bar(bar)
+                
+                for sig in signals:
+                    sig_symbol = sig.get("symbol", symbol)
+                    side_str = str(sig.get("side", "BUY")).upper()
+                    qty = Decimal(str(sig.get("quantity", "0")))
+                    if qty <= 0:
+                        continue
+                    
+                    broker_side = (
+                        BrokerOrderSide.BUY
+                        if side_str in ("BUY", "LONG")
+                        else BrokerOrderSide.SELL
+                    )
+                    
+                    # Use bar.close for price (bar is complete, so safe)
+                    est_price = sig.get("entry_price")
+                    price = Decimal(str(est_price)) if est_price else bar.close
+                    
+                    # ========================================================
+                    # RISK GATE (DO NOT BYPASS)
+                    # ========================================================
+                    rc = risk_mgr.validate_trade(
+                        symbol=sig_symbol,
+                        quantity=qty,
+                        side=broker_side,
+                        price=price,
+                        account_value=account_value,
+                        buying_power=buying_power,
+                        strategy=str(sig.get("strategy", "UNKNOWN")),
+                    )
+                    if not rc.approved:
+                        logger.info(
+                            f"Risk gate REJECTED signal: {rc.rejection_reason}",
+                            extra={"symbol": sig_symbol, "side": side_str}
+                        )
+                        continue
+                    
+                    # ========================================================
+                    # SUBMIT ORDER
+                    # ========================================================
+                    internal_id = uuid.uuid4().hex
+                    
+                    stop_loss = sig.get("stop_loss")
+                    take_profit = sig.get("take_profit")
+                    if stop_loss is not None:
+                        stop_loss = Decimal(str(stop_loss))
+                    if take_profit is not None:
+                        take_profit = Decimal(str(take_profit))
+                    
+                    exec_engine.submit_market_order(
+                        internal_order_id=internal_id,
+                        symbol=sig_symbol,
+                        quantity=qty,
+                        side=broker_side,
+                        strategy=str(sig.get("strategy", "UNKNOWN")),
+                        stop_loss=stop_loss,
+                        take_profit=take_profit,
+                    )
+            
+            if opts.run_once:
+                break
+        
+        except Exception as e:
+            state.error_count += 1
+            logger.error(
+                "Runtime loop error",
+                extra={"error": str(e)},
+                exc_info=True
+            )
+            
+            # Simple error storm kill-switch
+            if state.error_count >= 10:
+                logger.critical(
+                    "Error storm detected - killing runner",
+                    extra={"errors": state.error_count}
+                )
+                break
+        
+        # Sleep in 1s increments so SIGINT exits quickly
+        for _ in range(cycle):
+            if not state.running:
+                break
+            time.sleep(1)
+    
+    # ========================================================================
+    # SHUTDOWN
+    # ========================================================================
+    
+    try:
+        container.stop()
+    except Exception:
+        pass
+    
+    logger.info(
+        "Runner stopped",
+        extra={"mode": opts.mode, "errors": state.error_count}
+    )
+    return 0

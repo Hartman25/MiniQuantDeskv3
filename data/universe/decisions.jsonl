@@ -1,0 +1,7 @@
+# Trading bot writes accept/reject decisions here (one JSON object per line)
+# Format: {"id": "...", "ts": "...", "symbol": "...", "decision": "accept|reject", "expires": "...", "reason": "..."}
+{"id": "2026-01-26T05:15:39.595354Z:TSLA:scanner_v2", "ts": "2026-01-26T05:15:41.484714Z", "symbol": "TSLA", "decision": "accept", "expires": "2026-01-27T05:15:41.484714Z", "reason": "passed_all_filters_score_8.5", "bot_version": "v1"}
+{"id": "2026-01-26T05:15:39.595664Z:NVDA:scanner_v2", "ts": "2026-01-26T05:15:41.484987Z", "symbol": "NVDA", "decision": "reject", "expires": null, "reason": "price_out_of_range_520.0", "bot_version": "v1"}
+{"id": "2026-01-26T05:15:39.596059Z:AAPL:scanner_v2", "ts": "2026-01-26T05:15:41.485723Z", "symbol": "AAPL", "decision": "reject", "expires": null, "reason": "spread_filter_failed_85.0bps", "bot_version": "v1"}
+{"id": "2026-01-26T05:15:39.595664Z:NVDA:scanner_v2", "ts": "2026-01-26T07:01:55.567736Z", "symbol": "NVDA", "decision": "reject", "expires": null, "reason": "price_out_of_range_525.0", "bot_version": "v1"}
+{"id": "2026-01-26T05:15:39.596059Z:AAPL:scanner_v2", "ts": "2026-01-26T07:01:55.568137Z", "symbol": "AAPL", "decision": "reject", "expires": null, "reason": "spread_filter_failed_85.0bps", "bot_version": "v1"}
