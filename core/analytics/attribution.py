@@ -490,3 +490,65 @@ class TradeAttributionAnalyzer:
             if start_date <= t.exit_time <= end_date
         ]
         return filtered
+# --- PATCH: restore AttributionMetrics symbol expected by core.analytics.__init__ / tests ---
+
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional
+
+
+@dataclass
+class AttributionMetrics:
+    """
+    Compatibility container for attribution outputs.
+
+    Tests and core.analytics.__init__ expect this symbol to exist.
+    This class is intentionally flexible: it can hold known fields,
+    but also safely accepts extra keys via `extras`.
+    """
+
+    # Common/high-level fields (optional on purpose)
+    trades: Optional[int] = None
+    wins: Optional[int] = None
+    losses: Optional[int] = None
+
+    gross_pnl: Optional[float] = None
+    net_pnl: Optional[float] = None
+    win_rate: Optional[float] = None
+    profit_factor: Optional[float] = None
+    expectancy: Optional[float] = None
+    max_drawdown: Optional[float] = None
+
+    # Anything else we compute later goes here without breaking callers
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "AttributionMetrics":
+        """Build from a dict, capturing unknown keys into extras."""
+        known = {
+            "trades", "wins", "losses",
+            "gross_pnl", "net_pnl", "win_rate",
+            "profit_factor", "expectancy", "max_drawdown",
+        }
+        kwargs = {k: d.get(k) for k in known if k in d}
+        extras = {k: v for k, v in d.items() if k not in known}
+        obj = cls(**kwargs)
+        obj.extras.update(extras)
+        return obj
+
+    def to_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "trades": self.trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "gross_pnl": self.gross_pnl,
+            "net_pnl": self.net_pnl,
+            "win_rate": self.win_rate,
+            "profit_factor": self.profit_factor,
+            "expectancy": self.expectancy,
+            "max_drawdown": self.max_drawdown,
+        }
+        out.update(self.extras or {})
+        # Drop None values to keep logs clean
+        return {k: v for k, v in out.items() if v is not None}
+ 

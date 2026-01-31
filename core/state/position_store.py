@@ -147,6 +147,12 @@ class PositionStore:
         # Thread-local storage for connections
         self._local = threading.local()
         
+
+        # Keep a registry of all connections created across threads so we can
+        # reliably close them on shutdown (Windows keeps SQLite files locked
+        # if *any* connection remains open).
+        self._connections = {}  # thread_id -> sqlite3.Connection
+        self._conn_lock = threading.Lock()
         # Initialize database
         self._initialize_db()
         
@@ -166,7 +172,6 @@ class PositionStore:
         """
         if not hasattr(self._local, 'connection'):
             conn = sqlite3.Connection(str(self.db_path), check_same_thread=False)
-            
             # Enable WAL mode (write-ahead logging)
             conn.execute("PRAGMA journal_mode=WAL")
             
@@ -174,7 +179,11 @@ class PositionStore:
             conn.isolation_level = None
             
             # Set row factory for dict-like rows
-            conn.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row            # Register connection for global close()
+            with self._conn_lock:
+                self._connections[threading.get_ident()] = conn
+
+
             
             self._local.connection = conn
         
@@ -389,11 +398,33 @@ class PositionStore:
         )
     
     def close(self):
-        """Close database connections. Call on shutdown."""
+        """Close database connections. Call on shutdown.
+
+        IMPORTANT (Windows): SQLite database files remain locked as long as *any*
+        connection is open. Because this store uses thread-local connections,
+        other threads (e.g., an event bus worker thread) may have created their
+        own connections. We therefore keep a registry of connections and close
+        them all here.
+        """
+        # Close all known connections (across threads)
+        with self._conn_lock:
+            conns = list(self._connections.items())
+            self._connections.clear()
+
+        for tid, conn in conns:
+            try:
+                conn.close()
+            except Exception:
+                # best-effort close; don't mask shutdown
+                pass
+
+        # Clear local handle if present
         if hasattr(self._local, 'connection'):
-            self._local.connection.close()
-            del self._local.connection
-        
+            try:
+                del self._local.connection
+            except Exception:
+                pass
+
         self.logger.info("PositionStore closed")
     
     def __enter__(self):
