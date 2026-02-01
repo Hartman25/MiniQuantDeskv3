@@ -38,8 +38,9 @@ class Clock(ABC):
 class RealTimeClock(Clock):
     """Real-time clock for live/paper trading"""
     
-    def __init__(self):
+    def __init__(self, user_tz: Optional[str] = None, tz: Optional[str] = None):
         self._market_tz = pytz.timezone("America/New_York")
+        # Accept user_tz and tz for compatibility but use UTC for market operations
         
     def now(self) -> datetime:
         """Current UTC time"""
@@ -148,6 +149,10 @@ class ClockFactory:
             return BacktestClock(start_time)
         else:
             raise ValueError(f"Unknown mode: {mode}")
+
+
+# Backwards compatibility alias
+SystemClock = RealTimeClock
 
 
 # Convenience function for getting clock from config

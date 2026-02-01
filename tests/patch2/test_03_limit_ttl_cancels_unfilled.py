@@ -1,5 +1,5 @@
-# tests/patch2/test_03_limit_ttl_cancels_unfilled.py
 from core.state import OrderStatus
+
 
 def test_limit_ttl_cancels_unfilled_entry(patch_runtime):
     signals = [
@@ -11,15 +11,13 @@ def test_limit_ttl_cancels_unfilled_entry(patch_runtime):
             "limit_price": "99.90",
             "ttl_seconds": 5,
             "strategy": "VWAPMicroMeanReversion",
-
             "stop_loss": "99.50",
             "stop_loss_price": "99.50",
             "stop_price": "99.50",
         }
-
     ]
 
-    lifecycle, exec_engine = patch_runtime(signals, force_status=OrderStatus.CANCELLED)
+    _container, exec_engine = patch_runtime(signals, force_status=OrderStatus.CANCELLED, stale=True)
 
     call_names = [c[0] for c in exec_engine.calls]
     assert "submit_limit_order" in call_names

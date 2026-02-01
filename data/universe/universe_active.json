@@ -3,8 +3,12 @@
     "SPY",
     "QQQ"
   ],
-  "accepted": [],
-  "expires_by_symbol": {},
-  "last_updated": "2026-01-27T06:04:37.335739Z",
+  "accepted": [
+    "TSLA"
+  ],
+  "expires_by_symbol": {
+    "TSLA": "2026-02-02T21:00:00Z"
+  },
+  "last_updated": "2026-02-01T00:59:01.753540Z",
   "version": "1.0"
 }

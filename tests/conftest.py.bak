@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -121,22 +122,27 @@ class FakeStrategyCfg:
 
 
 class FakeConfig:
-    class Broker:
-        api_key = "x"
-        api_secret = "y"
-        paper_trading = True
+    def __init__(self, *, symbols=("SPY",), timeframe="1Min", universe_mode="core"):
+        self._d = {
+            "runtime": {"symbols": list(symbols), "timeframe": timeframe},
+            "universe": {"mode": universe_mode},  # IMPORTANT: prevents accepted-mode filtering
+            "broker": {"paper_trading": True},
+            "strategies": {},
+        }
 
-    broker = Broker()
-    strategies = [
-        FakeStrategyCfg(
-            name="VWAPMicroMeanReversion",
-            enabled=True,
-            symbols=["SPY"],
-            timeframe="1Min",
-            config={},
+        # keep any existing broker namespace behavior if you already had it
+        broker = self._d.get("broker", {})
+        from types import SimpleNamespace
+        self.broker = SimpleNamespace(
+            api_key=broker.get("api_key", "DUMMY"),
+            api_secret=broker.get("api_secret", "DUMMY"),
+            paper_trading=bool(broker.get("paper_trading", True)),
         )
-    ]
 
+        self.strategies = self._d.get("strategies", {})
+
+    def get(self, key, default=None):
+        return self._d.get(key, default)
 
 class FakeBroker:
     def get_bars(self, symbol: str, timeframe: str, limit: int):
@@ -256,6 +262,33 @@ def patch_runtime(monkeypatch, tmp_path):
         with pytest.raises(SystemExit):
             app_mod.run(opts)
 
-        return container, exec_engine
+        class _Cfg:
+            def __init__(self, d):
+                self._d = d
+                broker = d.get("broker", {})
+                self.broker = SimpleNamespace(
+                    api_key=broker.get("api_key", "DUMMY"),
+                    api_secret=broker.get("api_secret", "DUMMY"),
+                    paper_trading=bool(broker.get("paper_trading", True)),
+                )
+                self.strategies = d.get("strategies", {})
+
+            def get(self, key, default=None):
+                return self._d.get(key, default)
+
+        fake_cfg = _Cfg(
+            {
+                "runtime": {"symbols": ["SPY"], "timeframe": "1Min"},
+                "universe": {"mode": "core"},   # IMPORTANT: bypass accepted-mode filtering
+                "broker": {"paper_trading": True},
+                "strategies": {},
+            }
+        )
+
+        fake_cfg = FakeConfig(symbols=("SPY",), timeframe="1Min", universe_mode="core")
+
+        # Patch the seam the runtime actually uses
+        monkeypatch.setattr(container, "get_config", lambda _path: fake_cfg, raising=False)
+
 
     return _run_once

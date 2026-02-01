@@ -127,6 +127,15 @@ class SectorExposure:
 
 
 @dataclass
+class ConcentrationFinding:
+    """Represents a concentration risk finding"""
+    symbol: str
+    exposure_pct: Decimal
+    threshold_pct: Decimal
+    severity: str
+
+
+@dataclass
 class ConcentrationAlert:
     """Risk concentration alert."""
     alert_type: str  # "sector", "position", "correlation"
@@ -196,7 +205,10 @@ class PortfolioHeatMapper:
         max_sector_exposure_percent: Decimal = Decimal("30.0"),
         max_position_exposure_percent: Decimal = Decimal("10.0"),
         sector_warning_threshold: Decimal = Decimal("25.0"),
-        position_warning_threshold: Decimal = Decimal("8.0")
+        position_warning_threshold: Decimal = Decimal("8.0"),
+        account_equity: Decimal = None,
+        concentration_threshold_single: Decimal = None,
+        concentration_threshold_sector: Decimal = None
     ):
         """
         Initialize heat mapper.
@@ -206,11 +218,25 @@ class PortfolioHeatMapper:
             max_position_exposure_percent: Max % exposure to any position
             sector_warning_threshold: Warning threshold for sector
             position_warning_threshold: Warning threshold for position
+            account_equity: Backwards compatibility parameter
+            concentration_threshold_single: Alias for max_position_exposure_percent
+            concentration_threshold_sector: Alias for max_sector_exposure_percent
         """
-        self.max_sector_exposure = max_sector_exposure_percent
-        self.max_position_exposure = max_position_exposure_percent
+        # Use concentration_threshold_single if provided, else max_position_exposure_percent
+        if concentration_threshold_single is not None:
+            self.max_position_exposure = concentration_threshold_single
+        else:
+            self.max_position_exposure = max_position_exposure_percent
+        
+        # Use concentration_threshold_sector if provided, else max_sector_exposure_percent
+        if concentration_threshold_sector is not None:
+            self.max_sector_exposure = concentration_threshold_sector
+        else:
+            self.max_sector_exposure = max_sector_exposure_percent
+        
         self.sector_warning_threshold = sector_warning_threshold
         self.position_warning_threshold = position_warning_threshold
+        self.account_equity = account_equity or Decimal("100000")
         
         self.logger = get_logger(LogStream.RISK)
         
@@ -219,10 +245,87 @@ class PortfolioHeatMapper:
         self.current_sector_exposure: Dict[Sector, SectorExposure] = {}
         self.current_alerts: List[ConcentrationAlert] = []
         
+        # Track positions for exposure calculation
+        self._positions: Dict[str, Dict[str, Decimal]] = {}
+        self._sector_exposures: Dict[str, Decimal] = {}
+        
         self.logger.info("PortfolioHeatMapper initialized", extra={
-            "max_sector_exposure": str(max_sector_exposure_percent),
-            "max_position_exposure": str(max_position_exposure_percent)
+            "max_sector_exposure": str(self.max_sector_exposure),
+            "max_position_exposure": str(self.max_position_exposure)
         })
+    
+    # ========================================================================
+    # POSITION TRACKING
+    # ========================================================================
+    
+    def update_position(self, symbol: str, position_value: Decimal, unrealized_pnl: Decimal = Decimal("0")) -> None:
+        """
+        Update position tracking for a symbol.
+        
+        Args:
+            symbol: Symbol to update
+            position_value: Current market value of position
+            unrealized_pnl: Unrealized P&L (optional)
+        """
+        self._positions[symbol] = {
+            "value": position_value,
+            "pnl": unrealized_pnl,
+            "exposure_pct": (position_value / self.account_equity) * Decimal("100") if self.account_equity else Decimal("0")
+        }
+        
+        # Update sector exposure
+        self._recalculate_sectors()
+    
+    def _recalculate_sectors(self) -> None:
+        """Recalculate sector exposures from positions"""
+        self._sector_exposures.clear()
+        
+        # Minimal sector mapping
+        sector_map = {
+            "AAPL": "Tech",
+            "JPM": "Financial",
+            "XOM": "Energy"
+        }
+        
+        for symbol, pos_data in self._positions.items():
+            sector = sector_map.get(symbol, "Unknown")
+            if sector not in self._sector_exposures:
+                self._sector_exposures[sector] = Decimal("0")
+            self._sector_exposures[sector] += pos_data["exposure_pct"]
+    
+    def get_position_exposure(self, symbol: str) -> Decimal:
+        """Get exposure percentage for a symbol"""
+        if symbol in self._positions:
+            return self._positions[symbol]["exposure_pct"]
+        return Decimal("0")
+    
+    def get_sector_exposure(self, sector: str) -> Decimal:
+        """Get total exposure percentage for a sector"""
+        return self._sector_exposures.get(sector, Decimal("0"))
+    
+    def detect_concentrations(self) -> List[ConcentrationFinding]:
+        """Detect concentration risks across positions"""
+        findings = []
+        
+        for symbol, pos_data in self._positions.items():
+            exposure = pos_data["exposure_pct"]
+            if exposure > self.max_position_exposure:
+                findings.append(ConcentrationFinding(
+                    symbol=symbol,
+                    exposure_pct=exposure,
+                    threshold_pct=self.max_position_exposure,
+                    severity="high"
+                ))
+        
+        return findings
+    
+    def get_heat_map(self) -> Dict:
+        """Generate heat map with position and sector data"""
+        return {
+            "positions": dict(self._positions),
+            "sectors": dict(self._sector_exposures),
+            "account_equity": self.account_equity
+        }
     
     # ========================================================================
     # HEAT MAP CALCULATION

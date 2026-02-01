@@ -778,7 +778,13 @@ class OrderExecutionEngine:
         filled_qty: Decimal,
         fill_price: Decimal
     ):
-        """Create position on order fill."""
+        """
+        Create or update position on order fill.
+        
+        CRITICAL LOGIC:
+        - BUY orders: Add to position (or create if none)
+        - SELL orders: Reduce from position (or delete if zero)
+        """
         # Get order metadata
         with self._metadata_lock:
             metadata = self._order_metadata.get(internal_order_id)
@@ -790,30 +796,98 @@ class OrderExecutionEngine:
             )
             return
         
-        # Create position
-        position = Position(
-            symbol=metadata["symbol"],
-            quantity=filled_qty,
-            entry_price=fill_price,
-            entry_time=datetime.now(timezone.utc),  # PATCH 4: UTC-aware
-            strategy=metadata["strategy"],
-            order_id=internal_order_id,
-            stop_loss=metadata.get("stop_loss"),
-            take_profit=metadata.get("take_profit")
-        )
+        symbol = metadata["symbol"]
+        side = metadata["side"]
         
-        # Store position
-        self.position_store.upsert(position)
+        # Get existing position
+        existing_position = self.position_store.get(symbol)
         
-        self.logger.info(
-            "Position created",
-            extra={
-                "symbol": position.symbol,
-                "quantity": str(position.quantity),
-                "entry_price": str(position.entry_price),
-                "strategy": position.strategy
-            }
-        )
+        # CASE 1: BUY order
+        if side == BrokerOrderSide.BUY:
+            if existing_position is None:
+                # Create new long position
+                position = Position(
+                    symbol=symbol,
+                    quantity=filled_qty,
+                    entry_price=fill_price,
+                    entry_time=datetime.now(timezone.utc),
+                    strategy=metadata["strategy"],
+                    order_id=internal_order_id,
+                    stop_loss=metadata.get("stop_loss"),
+                    take_profit=metadata.get("take_profit")
+                )
+                self.position_store.upsert(position)
+                self.logger.info(
+                    f"Position opened: {symbol} +{filled_qty} @ ${fill_price}",
+                    extra={"symbol": symbol, "quantity": str(filled_qty)}
+                )
+            else:
+                # Add to existing position
+                new_quantity = existing_position.quantity + filled_qty
+                # Update entry price with weighted average
+                total_cost = (existing_position.quantity * existing_position.entry_price) + (filled_qty * fill_price)
+                new_entry_price = total_cost / new_quantity
+                
+                position = Position(
+                    symbol=symbol,
+                    quantity=new_quantity,
+                    entry_price=new_entry_price,
+                    entry_time=existing_position.entry_time,  # Keep original entry time
+                    strategy=existing_position.strategy,
+                    order_id=existing_position.order_id,  # Keep original order ID
+                    stop_loss=existing_position.stop_loss,
+                    take_profit=existing_position.take_profit
+                )
+                self.position_store.upsert(position)
+                self.logger.info(
+                    f"Position increased: {symbol} +{filled_qty} (total={new_quantity})",
+                    extra={"symbol": symbol, "new_quantity": str(new_quantity)}
+                )
+        
+        # CASE 2: SELL order
+        elif side == BrokerOrderSide.SELL:
+            if existing_position is None:
+                self.logger.warning(
+                    f"SELL order filled but no position exists: {symbol}",
+                    extra={"symbol": symbol, "filled_qty": str(filled_qty)}
+                )
+                return
+            
+            # Reduce position
+            new_quantity = existing_position.quantity - filled_qty
+            
+            if new_quantity < 0:
+                self.logger.error(
+                    f"Position over-closed: {symbol} had {existing_position.quantity}, sold {filled_qty}",
+                    extra={"symbol": symbol, "existing": str(existing_position.quantity), "sold": str(filled_qty)}
+                )
+                # Force close completely
+                new_quantity = Decimal("0")
+            
+            if new_quantity == 0:
+                # Position fully closed
+                self.position_store.delete(symbol)
+                self.logger.info(
+                    f"Position closed: {symbol} -{filled_qty} @ ${fill_price}",
+                    extra={"symbol": symbol, "closed_qty": str(filled_qty)}
+                )
+            else:
+                # Partial close
+                position = Position(
+                    symbol=symbol,
+                    quantity=new_quantity,
+                    entry_price=existing_position.entry_price,  # Keep original entry price
+                    entry_time=existing_position.entry_time,
+                    strategy=existing_position.strategy,
+                    order_id=existing_position.order_id,
+                    stop_loss=existing_position.stop_loss,
+                    take_profit=existing_position.take_profit
+                )
+                self.position_store.upsert(position)
+                self.logger.info(
+                    f"Position reduced: {symbol} -{filled_qty} (remaining={new_quantity})",
+                    extra={"symbol": symbol, "remaining_qty": str(new_quantity)}
+                )
 
 
 # ============================================================================

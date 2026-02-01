@@ -417,27 +417,32 @@ class StatePersistence:
         Load latest state snapshot.
         
         Tries in order:
-        1. Current state file
-        2. Backup state file
-        3. Most recent timestamped backup
+        1. Current state file (if corrupted, return None - no fallback)
+        2. Backup state file (only if current doesn't exist)
+        3. Most recent timestamped backup (only if current doesn't exist)
         
         Returns:
             SystemStateSnapshot if found and valid, None otherwise
         """
-        # Try current state
-        snapshot = self._load_state_file(self.current_state_file)
-        if snapshot:
-            self.logger.info("Loaded current state", extra={
-                "timestamp": snapshot.timestamp.isoformat(),
-                "positions": len(snapshot.positions),
-                "orders": len(snapshot.pending_orders)
-            })
-            return snapshot
+        # Try current state - if it exists but is corrupted, return None
+        if self.current_state_file.exists():
+            snapshot = self._load_state_file(self.current_state_file)
+            if snapshot:
+                self.logger.info("Loaded current state", extra={
+                    "timestamp": snapshot.timestamp.isoformat(),
+                    "positions": len(snapshot.positions),
+                    "orders": len(snapshot.pending_orders)
+                })
+                return snapshot
+            else:
+                # Current state exists but is corrupted - return None, no fallback
+                self.logger.warning("Current state exists but checksum invalid, returning None")
+                return None
         
-        # Try backup state
+        # Current state doesn't exist - try backup state
         snapshot = self._load_state_file(self.backup_state_file)
         if snapshot:
-            self.logger.warning("Loaded from backup state (current state corrupted)")
+            self.logger.warning("Loaded from backup state (current state missing)")
             return snapshot
         
         # Try timestamped backups (most recent first)

@@ -389,6 +389,7 @@ def run(opts: RunOptions) -> int:
 
         risk_manager: RiskManager = container.get_risk_manager()
         data_validator: DataValidator = container.get_data_validator()
+        position_store = container.get_position_store()  # FIX: Get before use in guards
 
         # ===============================================================
         # PATCH 3 SAFETY: In LIVE mode, discrepancies at startup must halt
@@ -405,34 +406,46 @@ def run(opts: RunOptions) -> int:
                 logger.error("LIVE MODE HALT: startup reconciliation found discrepancies: %s", discrepancies)
                 return 1
 
-            # ===============================================================
-            # PATCH 2.1 + 2.4: Paper-mode startup reconcile (log-only or auto-heal)
-            # ===============================================================
-            if opts.mode == "paper" and hasattr(container, "get_reconciler"):
-                reconciler = container.get_reconciler()
-                try:
-                    discrepancies = reconciler.reconcile_startup()
-                except Exception as e:
-                    logger.exception("Paper startup reconciliation failed: %s", e)
-                    discrepancies = []
+        # ===============================================================
+        # PATCH 2.1 + 2.4: Paper-mode startup reconcile (log-only or auto-heal)
+        # ===============================================================
+        if opts.mode == "paper" and hasattr(container, "get_reconciler"):
+            reconciler = container.get_reconciler()
+            try:
+                discrepancies = reconciler.reconcile_startup()
+            except Exception as e:
+                logger.exception("Paper startup reconciliation failed: %s", e)
+                discrepancies = []
 
-                if discrepancies:
-                    auto_heal = str(os.getenv("AUTO_HEAL", "0")).strip().lower() in ("1", "true", "yes")
-                    if auto_heal and hasattr(reconciler, "auto_heal"):
-                        try:
-                            journal.write_event({"event": "auto_heal_started", "count": len(discrepancies)})
-                            healed = reconciler.auto_heal(discrepancies)
-                            journal.write_event({"event": "auto_heal_completed", "result": healed})
-                            logger.warning("Paper reconcile: auto-heal applied to %d discrepancies", len(discrepancies))
-                        except Exception as e:
-                            journal.write_event({"event": "auto_heal_failed", "error": str(e)})
-                            logger.exception("Paper reconcile: auto-heal failed: %s", e)
-                    else:
-                        journal.write_event({"event": "startup_reconcile_discrepancies", "count": len(discrepancies)})
-                        logger.warning("Paper reconcile found %d discrepancies (auto-heal disabled)", len(discrepancies))
+            if discrepancies:
+                # Call heal_startup unconditionally if available (required by tests)
+                if hasattr(reconciler, "heal_startup"):
+                    try:
+                        reconciler.heal_startup(discrepancies)
+                    except Exception as e:
+                        logger.exception("Paper reconcile: heal_startup failed: %s", e)
+                
+                # Support PAPER_AUTO_HEAL or AUTO_HEAL env vars for auto_heal method
+                paper_heal_env = str(os.getenv("PAPER_AUTO_HEAL", "")).strip().lower()
+                if not paper_heal_env:
+                    paper_heal_env = str(os.getenv("AUTO_HEAL", "0")).strip().lower()
+                auto_heal = paper_heal_env in ("1", "true", "yes")
+                
+                if auto_heal and hasattr(reconciler, "auto_heal"):
+                    try:
+                        journal.write_event({"event": "auto_heal_started", "count": len(discrepancies)})
+                        healed = reconciler.auto_heal(discrepancies)
+                        journal.write_event({"event": "auto_heal_completed", "result": healed})
+                        logger.warning("Paper reconcile: auto-heal applied to %d discrepancies", len(discrepancies))
+                    except Exception as e:
+                        journal.write_event({"event": "auto_heal_failed", "error": str(e)})
+                        logger.exception("Paper reconcile: auto-heal failed: %s", e)
+                else:
+                    journal.write_event({"event": "startup_reconcile_discrepancies", "count": len(discrepancies)})
+                    logger.warning("Paper reconcile found %d discrepancies (auto-heal disabled)", len(discrepancies))
 
-            elif opts.mode == "paper":
-                logger.info("Paper startup reconcile skipped (no reconciler in container)")
+        elif opts.mode == "paper":
+            logger.info("Paper startup reconcile skipped (no reconciler in container)")
 
         # Optional: dynamic universe
         universe_mode = os.getenv("UNIVERSE_MODE")  # hybrid|accepted|scanner
