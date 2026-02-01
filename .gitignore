@@ -100,3 +100,20 @@ data/positions/*.sqlite
 data/universe/*.jsonl
 data/universe/state.json
 data/universe/universe_active.json
+
+# virtual envs (never commit)
+.venv/
+venv/
+
+# python junk
+__pycache__/
+*.pyc
+*.pyo
+
+# local archives / scratch
+_archive/
+*_stage/
+*_check/
+debug_test.py
+patch_conftest.py
+temp_patch_conftest.py
