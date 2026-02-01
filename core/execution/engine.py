@@ -82,7 +82,8 @@ class OrderExecutionEngine:
         state_machine: OrderStateMachine,
         position_store: PositionStore,
         symbol_properties: Optional[SymbolPropertiesCache] = None,  # FIXED: Was SymbolPropertiesRegistry
-        order_tracker: Optional[OrderTracker] = None  # NEW
+        order_tracker: Optional[OrderTracker] = None,  # NEW
+        transaction_log=None,  # P1: optional TransactionLog for crash-restart seeding
     ):
         """Initialize execution engine."""
         self.broker = broker
@@ -98,11 +99,37 @@ class OrderExecutionEngine:
         # Track order metadata
         self._order_metadata: Dict[str, Dict] = {}
         self._metadata_lock = threading.Lock()
-        
+
         # PATCH 2: Duplicate order prevention (engine-level defense)
         self._submitted_order_ids: set[str] = set()
-        
+
+        # P1 Patch 2: Seed _submitted_order_ids from persistent transaction log
+        # so that after a crash+restart we still reject duplicate internal IDs.
+        if transaction_log is not None:
+            self._seed_submitted_ids_from_log(transaction_log)
+
         self.logger.info("OrderExecutionEngine initialized")
+
+    def _seed_submitted_ids_from_log(self, transaction_log) -> None:
+        """Replay ORDER_SUBMIT events from the transaction log to rebuild
+        the in-memory duplicate-order guard after a restart."""
+        try:
+            for event in transaction_log.iter_events():
+                if event.get("event_type") == "ORDER_SUBMIT":
+                    oid = event.get("internal_order_id")
+                    if oid:
+                        self._submitted_order_ids.add(oid)
+            if self._submitted_order_ids:
+                self.logger.info(
+                    "Seeded %d submitted order IDs from transaction log",
+                    len(self._submitted_order_ids),
+                )
+        except Exception:
+            self.logger.warning(
+                "Failed to seed submitted IDs from transaction log",
+                exc_info=True,
+            )
+
     def set_trade_journal(self, journal: TradeJournal, run_id: Optional[str] = None) -> None:
         self.trade_journal = journal
         if run_id:

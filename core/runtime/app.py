@@ -29,6 +29,9 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 from core.brokers import AlpacaBrokerConnector, BrokerOrderSide
+from core.runtime.circuit_breaker import ConsecutiveFailureBreaker
+from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus
+from core.recovery.persistence import StatePersistence
 from core.data.contract import MarketDataContract
 from core.data.validator import DataValidator
 from core.di.container import Container
@@ -168,10 +171,12 @@ def _is_exit_signal(sig: dict) -> bool:
     Treat explicit exits as non-entry signals.
     Supported:
       - action in {"EXIT","CLOSE","SELL"} when you are long-only
+      - side == "SELL" when you are long-only
       - intent == "exit"
       - reduce_only == True
     """
     action = str(sig.get("action") or "").upper()
+    side = str(sig.get("side") or "").upper()
     intent = str(sig.get("intent") or "").lower()
     reduce_only = bool(sig.get("reduce_only") or False)
 
@@ -182,11 +187,74 @@ def _is_exit_signal(sig: dict) -> bool:
     if action in {"EXIT", "CLOSE"}:
         return True
 
-    # If your system is LONG-only, SELL is treated as exit
-    if action == "SELL":
+    # If your system is LONG-only, SELL is treated as exit (check both action and side)
+    if action == "SELL" or side == "SELL":
         return True
 
     return False
+
+def _try_recovery(broker, position_store, order_machine, state_dir: Optional[Path] = None) -> RecoveryStatus:
+    """
+    P1 Patch 7: Attempt crash-recovery via RecoveryCoordinator.
+
+    Returns RecoveryStatus. If FAILED, the caller should halt.
+    On any internal exception, returns REBUILT (fail-open so the
+    loop can still start).
+    """
+    try:
+        sdir = state_dir or Path(os.getenv("STATE_DIR", "data/state"))
+        persistence = StatePersistence(state_dir=sdir)
+        coord = RecoveryCoordinator(
+            persistence=persistence,
+            broker=broker,
+            position_store=position_store,
+            order_machine=order_machine,
+        )
+        report = coord.recover()
+        logger.info(
+            "Recovery complete: %s (positions recovered=%d rebuilt=%d)",
+            report.status.value,
+            report.positions_recovered,
+            report.positions_rebuilt,
+        )
+        return report.status
+    except Exception:
+        logger.warning("Recovery coordinator raised; continuing with REBUILT", exc_info=True)
+        return RecoveryStatus.REBUILT
+
+
+def _load_protective_stops_from_broker(broker) -> Dict[str, str]:
+    """
+    P1 Patch 3: On restart, query the broker for open STOP SELL orders
+    and return {symbol: broker_order_id} so that protective_stop_ids
+    can be rebuilt.
+
+    Returns empty dict on any failure (fail-open: safe because the
+    worst case is placing a duplicate stop, which the single-trade guard
+    will block anyway).
+    """
+    result: Dict[str, str] = {}
+    try:
+        if not hasattr(broker, "list_open_orders"):
+            return result
+        open_orders = broker.list_open_orders() or []
+        for o in open_orders:
+            if isinstance(o, dict):
+                otype = str(o.get("order_type", "")).lower()
+                oside = str(o.get("side", "")).lower()
+                osym = o.get("symbol", "")
+                oid = o.get("id", "")
+            else:
+                otype = str(getattr(o, "order_type", "")).lower()
+                oside = str(getattr(o, "side", "")).lower()
+                osym = getattr(o, "symbol", "")
+                oid = getattr(o, "id", "")
+            if otype == "stop" and oside == "sell" and osym and oid:
+                result[str(osym).upper()] = str(oid)
+    except Exception:
+        pass
+    return result
+
 
 def _emit_limit_ttl_cancel_event(
     *,
@@ -392,6 +460,15 @@ def run(opts: RunOptions) -> int:
         position_store = container.get_position_store()  # FIX: Get before use in guards
 
         # ===============================================================
+        # P1 Patch 7: Recovery coordinator – reconstruct state on startup
+        # ===============================================================
+        _order_machine = getattr(exec_engine, "state_machine", None) if exec_engine else None
+        recovery_status = _try_recovery(broker, position_store, _order_machine)
+        if recovery_status == RecoveryStatus.FAILED:
+            logger.error("RECOVERY FAILED – halting runtime for safety")
+            return 1
+
+        # ===============================================================
         # PATCH 3 SAFETY: In LIVE mode, discrepancies at startup must halt
         # ===============================================================
         if opts.mode == "live":
@@ -521,10 +598,17 @@ def run(opts: RunOptions) -> int:
 
         cycle_count = 0
         orphan_check_interval = 10
-        protective_stop_ids: Dict[str, str] = {}
+        # P1 Patch 3: reload protective stops from broker on restart
+        protective_stop_ids: Dict[str, str] = _load_protective_stops_from_broker(broker)
+        if protective_stop_ids:
+            logger.info("Reloaded %d protective stop(s) from broker", len(protective_stop_ids))
         _open_guard_cache: dict[str, dict] = {}  # optional memo per loop iteration
         cooldown_s = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "30") or "30")
         last_action_ts: Dict[Tuple[str, str, str], float] = {}
+
+        # P1 Patch 1: circuit breaker – halt after N consecutive loop failures
+        _max_consecutive = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5") or "5")
+        _circuit_breaker = ConsecutiveFailureBreaker(max_failures=_max_consecutive)
 
         while state.running:
             try:
@@ -1041,6 +1125,9 @@ def run(opts: RunOptions) -> int:
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
 
+                # P1: successful cycle – reset circuit breaker
+                _circuit_breaker.record_success()
+
                 if opts.run_once:
                     state.running = False
                     break
@@ -1054,6 +1141,15 @@ def run(opts: RunOptions) -> int:
                 except Exception:
                     pass
                 logger.exception(f"Runtime loop error: {e}")
+
+                # P1: record failure and check circuit breaker
+                _circuit_breaker.record_failure()
+                if _circuit_breaker.is_tripped:
+                    logger.error(
+                        "CIRCUIT BREAKER TRIPPED: %d consecutive failures – halting",
+                        _circuit_breaker.failure_count,
+                    )
+                    return 1
 
                 if opts.run_once:
                     return 1
