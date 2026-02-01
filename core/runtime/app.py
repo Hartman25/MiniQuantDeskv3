@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple  # FIX: added Any
 
 import pandas as pd
 
@@ -48,6 +48,7 @@ logger = get_logger(LogStream.SYSTEM)
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _cooldown_key(strategy: str, symbol: str, side: str) -> tuple[str, str, str]:
     return (strategy or "UNKNOWN", symbol, side.upper())
@@ -166,6 +167,7 @@ def _single_trade_should_block_entry(
         # fail-open for tests/paper, fail-closed if explicitly requested
         return True if fail_closed else False
 
+
 def _is_exit_signal(sig: dict) -> bool:
     """
     Treat explicit exits as non-entry signals.
@@ -192,6 +194,7 @@ def _is_exit_signal(sig: dict) -> bool:
         return True
 
     return False
+
 
 def _try_recovery(broker, position_store, order_machine, state_dir: Optional[Path] = None) -> RecoveryStatus:
     """
@@ -274,11 +277,6 @@ def _emit_limit_ttl_cancel_event(
 ) -> None:
     """
     PATCH 2.3: canonical journal event schema for TTL-cancelled limit entries.
-
-    Design:
-      - Stable keys (always present)
-      - UTC timestamp included
-      - run_id included when available
     """
     event = {
         "event": "ORDER_TTL_CANCEL",
@@ -348,19 +346,14 @@ def _safe_decimal(v, default: Decimal = Decimal("0")) -> Decimal:
 def _ensure_strategy_registry_bootstrapped(container: Container) -> None:
     """
     Register built-in strategies into StrategyRegistry.
-
-    Strategies must be registered before instantiation from config.
-    Registry uses class.__name__ as the key.
     """
     registry = container.get_strategy_registry()
 
     try:
         from strategies.vwap_mean_reversion import VWAPMeanReversion
-
         registry.register(VWAPMeanReversion)
 
         from strategies.vwap_micro_mean_reversion import VWAPMicroMeanReversion
-
         registry.register(VWAPMicroMeanReversion)
     except ValueError:
         # Already registered
@@ -455,8 +448,8 @@ def run(opts: RunOptions) -> int:
         if exec_engine and hasattr(exec_engine, "set_trade_journal"):
             exec_engine.set_trade_journal(trade_journal, run_id=trade_run_id)
 
-        risk_manager: RiskManager = container.get_risk_manager()
-        data_validator: DataValidator = container.get_data_validator()
+        risk_manager = container.get_risk_manager()
+        data_validator = container.get_data_validator()
         position_store = container.get_position_store()  # FIX: Get before use in guards
 
         # ===============================================================
@@ -495,19 +488,17 @@ def run(opts: RunOptions) -> int:
                 discrepancies = []
 
             if discrepancies:
-                # Call heal_startup unconditionally if available (required by tests)
                 if hasattr(reconciler, "heal_startup"):
                     try:
                         reconciler.heal_startup(discrepancies)
                     except Exception as e:
                         logger.exception("Paper reconcile: heal_startup failed: %s", e)
-                
-                # Support PAPER_AUTO_HEAL or AUTO_HEAL env vars for auto_heal method
+
                 paper_heal_env = str(os.getenv("PAPER_AUTO_HEAL", "")).strip().lower()
                 if not paper_heal_env:
                     paper_heal_env = str(os.getenv("AUTO_HEAL", "0")).strip().lower()
                 auto_heal = paper_heal_env in ("1", "true", "yes")
-                
+
                 if auto_heal and hasattr(reconciler, "auto_heal"):
                     try:
                         journal.write_event({"event": "auto_heal_started", "count": len(discrepancies)})
@@ -530,7 +521,6 @@ def run(opts: RunOptions) -> int:
         if universe_mode:
             try:
                 from core.universe import get_universe_symbols
-
                 universe_symbols = get_universe_symbols(mode=universe_mode)
             except Exception as e:
                 logger.warning(f"Universe mode '{universe_mode}' requested but unavailable: {e}")
@@ -598,10 +588,12 @@ def run(opts: RunOptions) -> int:
 
         cycle_count = 0
         orphan_check_interval = 10
+
         # P1 Patch 3: reload protective stops from broker on restart
         protective_stop_ids: Dict[str, str] = _load_protective_stops_from_broker(broker)
         if protective_stop_ids:
             logger.info("Reloaded %d protective stop(s) from broker", len(protective_stop_ids))
+
         _open_guard_cache: dict[str, dict] = {}  # optional memo per loop iteration
         cooldown_s = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "30") or "30")
         last_action_ts: Dict[Tuple[str, str, str], float] = {}
@@ -648,10 +640,10 @@ def run(opts: RunOptions) -> int:
                         sig_limit = sig.get("limit_price")
                         sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(str(sig.get("price", bar.close)))
                         sig_strategy = sig.get("strategy", "UNKNOWN")
+
                         # PATCH 2.6: single-trade-at-a-time guard (block entries if position or open order exists)
                         if not _is_exit_signal(sig):
                             try:
-                                # Prefer a real method if present
                                 open_orders = []
                                 if hasattr(exec_engine, "get_open_orders"):
                                     open_orders = exec_engine.get_open_orders(symbol=sig_symbol) or []
@@ -665,7 +657,6 @@ def run(opts: RunOptions) -> int:
                                     p = position_store.get_position(sig_symbol)
                                     pos_qty = getattr(p, "qty", None) if p is not None else None
 
-                                # fallback: scan all positions if needed
                                 if pos_qty is None and hasattr(position_store, "get_all_positions"):
                                     allp = position_store.get_all_positions() or []
                                     for p in allp:
@@ -679,7 +670,7 @@ def run(opts: RunOptions) -> int:
                                     try:
                                         has_position = float(pos_qty) != 0.0
                                     except Exception:
-                                        has_position = True  # if weird type, assume present
+                                        has_position = True
 
                                 has_open_order = bool(open_orders)
 
@@ -699,7 +690,6 @@ def run(opts: RunOptions) -> int:
                                     continue
 
                             except Exception as e:
-                                # If guard fails, fail CLOSED (block) — safety > trading
                                 journal.write_event({
                                     "event": "single_trade_block",
                                     "ts_utc": _utc_iso(),
@@ -713,7 +703,6 @@ def run(opts: RunOptions) -> int:
                                     "reason": f"guard_error:{type(e).__name__}",
                                 })
                                 continue
-
 
                         # PATCH 2.5: runtime cooldown gate (anti-spam / idempotency)
                         key = _cooldown_key(sig_strategy, sig_symbol, side_str)
@@ -959,19 +948,6 @@ def run(opts: RunOptions) -> int:
                                     final_status=getattr(final_status, "value", str(final_status)),
                                     reason="limit_ttl_expired_no_chase",
                                 )
-
-                                logger.info(
-                                    "ORDER_TTL_CANCEL",
-                                    extra={
-                                        "symbol": sig_symbol,
-                                        "strategy": sig_strategy,
-                                        "internal_order_id": internal_id,
-                                        "broker_order_id": broker_order_id,
-                                        "final_status": getattr(final_status, "value", str(final_status)),
-                                        "ttl_seconds": ttl_seconds,
-                                        "reason": "limit_ttl_expired_no_chase",
-                                    },
-                                )
                                 continue
 
                         else:
@@ -1050,9 +1026,11 @@ def run(opts: RunOptions) -> int:
                                             "qty": str(filled_qty),
                                         }
                                     )
-                                    logger.info("Protective STOP placed", extra={"symbol": sig_symbol, "stop_price": str(stop_price_dec), "stop_broker_id": stop_id})
                                 except Exception:
-                                    logger.exception("Failed to place protective STOP", extra={"symbol": sig_symbol, "stop_price": str(stop_price), "filled_qty": str(filled_qty)})
+                                    logger.exception(
+                                        "Failed to place protective STOP",
+                                        extra={"symbol": sig_symbol, "stop_price": str(stop_price), "filled_qty": str(filled_qty)},
+                                    )
 
                         if filled_qty is not None and fill_price is not None:
                             journal.write_event(
@@ -1107,25 +1085,24 @@ def run(opts: RunOptions) -> int:
                         broker_orders = {order.id: order for order in broker_orders_list}
 
                         orphans = order_tracker.get_orphaned_orders(broker_orders)
+                        shadows = order_tracker.get_shadow_orders(broker_orders)
+
                         if orphans:
                             logger.error(
                                 f"ORPHAN ORDERS DETECTED: {len(orphans)} orders",
                                 extra={"orphan_broker_ids": orphans, "action": "Manual review required"},
                             )
-
-                        shadows = order_tracker.get_shadow_orders(broker_orders)
                         if shadows:
                             logger.error(
                                 f"SHADOW ORDERS DETECTED: {len(shadows)} orders",
                                 extra={"shadow_client_ids": shadows, "action": "Manual review required"},
                             )
-
                         if not orphans and not shadows:
                             logger.info("Orphan check: No drift detected")
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
 
-                # P1: successful cycle – reset circuit breaker
+                # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()
 
                 if opts.run_once:
@@ -1142,7 +1119,6 @@ def run(opts: RunOptions) -> int:
                     pass
                 logger.exception(f"Runtime loop error: {e}")
 
-                # P1: record failure and check circuit breaker
                 _circuit_breaker.record_failure()
                 if _circuit_breaker.is_tripped:
                     logger.error(
