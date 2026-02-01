@@ -94,3 +94,9 @@ config/*.yml
 # Local logs
 logs/
 
+# runtime / generated data (do not commit)
+data/positions/*.db
+data/positions/*.sqlite
+data/universe/*.jsonl
+data/universe/state.json
+data/universe/universe_active.json

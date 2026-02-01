@@ -30,7 +30,7 @@ class FakeBrokerConnector:
 
     def get_bars(self, symbol: str, timeframe: str, limit: int = 1) -> pd.DataFrame:
         """Return minimal DataFrame for _df_to_contracts."""
-        idx = pd.date_range(end=pd.Timestamp.utcnow(), periods=1, freq="1min")
+        idx = pd.date_range(end=pd.Timestamp.now("UTC"), periods=1, freq="1min")
         return pd.DataFrame(
             {
                 "open": [100.0],

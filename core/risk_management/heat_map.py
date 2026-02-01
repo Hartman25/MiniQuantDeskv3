@@ -25,7 +25,7 @@ Based on institutional portfolio management and risk visualization.
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 from collections import defaultdict
 from enum import Enum
 
@@ -107,6 +107,26 @@ class PositionHeat:
 
 
 @dataclass
+class PositionHeatItem:
+    """Simple position heat item for test compatibility."""
+    symbol: str
+    value: Decimal
+    pnl: Decimal
+    exposure_pct: Decimal
+    heat_score: float
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary."""
+        return {
+            "symbol": self.symbol,
+            "value": str(self.value),
+            "pnl": str(self.pnl),
+            "exposure_pct": str(self.exposure_pct),
+            "heat_score": round(self.heat_score, 3)
+        }
+
+
+@dataclass
 class SectorExposure:
     """Exposure for a sector."""
     sector: Sector
@@ -133,6 +153,15 @@ class ConcentrationFinding:
     exposure_pct: Decimal
     threshold_pct: Decimal
     severity: str
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary."""
+        return {
+            "symbol": self.symbol,
+            "exposure_pct": str(self.exposure_pct),
+            "threshold_pct": str(self.threshold_pct),
+            "severity": self.severity
+        }
 
 
 @dataclass
@@ -218,7 +247,7 @@ class PortfolioHeatMapper:
             max_position_exposure_percent: Max % exposure to any position
             sector_warning_threshold: Warning threshold for sector
             position_warning_threshold: Warning threshold for position
-            account_equity: Backwards compatibility parameter
+            account_equity: Account equity for calculations
             concentration_threshold_single: Alias for max_position_exposure_percent
             concentration_threshold_sector: Alias for max_sector_exposure_percent
         """
@@ -247,12 +276,26 @@ class PortfolioHeatMapper:
         
         # Track positions for exposure calculation
         self._positions: Dict[str, Dict[str, Decimal]] = {}
-        self._sector_exposures: Dict[str, Decimal] = {}
+        self._sector_exposures: Dict[Sector, Decimal] = {}
         
         self.logger.info("PortfolioHeatMapper initialized", extra={
             "max_sector_exposure": str(self.max_sector_exposure),
             "max_position_exposure": str(self.max_position_exposure)
         })
+    
+    # ========================================================================
+    # TEST-COMPATIBLE PROPERTIES
+    # ========================================================================
+    
+    @property
+    def threshold_single(self) -> Decimal:
+        """Single-position concentration threshold (test compatibility)."""
+        return self.max_position_exposure
+    
+    @property
+    def threshold_sector(self) -> Decimal:
+        """Sector concentration threshold (test compatibility)."""
+        return self.max_sector_exposure
     
     # ========================================================================
     # POSITION TRACKING
@@ -276,19 +319,39 @@ class PortfolioHeatMapper:
         # Update sector exposure
         self._recalculate_sectors()
     
+    def remove_position(self, symbol: str) -> None:
+        """
+        Remove a position from tracking.
+        
+        Args:
+            symbol: Symbol to remove
+        """
+        if symbol in self._positions:
+            del self._positions[symbol]
+            self._recalculate_sectors()
+    
+    def update_account_equity(self, new_equity: Decimal) -> None:
+        """
+        Update account equity and recalculate all exposures.
+        
+        Args:
+            new_equity: New account equity value
+        """
+        self.account_equity = new_equity
+        
+        # Recalculate all position exposures
+        for symbol, pos_data in self._positions.items():
+            pos_data["exposure_pct"] = (pos_data["value"] / self.account_equity) * Decimal("100") if self.account_equity else Decimal("0")
+        
+        # Recalculate sector exposures
+        self._recalculate_sectors()
+    
     def _recalculate_sectors(self) -> None:
-        """Recalculate sector exposures from positions"""
+        """Recalculate sector exposures from positions using Sector enums"""
         self._sector_exposures.clear()
         
-        # Minimal sector mapping
-        sector_map = {
-            "AAPL": "Tech",
-            "JPM": "Financial",
-            "XOM": "Energy"
-        }
-        
         for symbol, pos_data in self._positions.items():
-            sector = sector_map.get(symbol, "Unknown")
+            sector = SYMBOL_TO_SECTOR.get(symbol, Sector.UNKNOWN)
             if sector not in self._sector_exposures:
                 self._sector_exposures[sector] = Decimal("0")
             self._sector_exposures[sector] += pos_data["exposure_pct"]
@@ -299,9 +362,117 @@ class PortfolioHeatMapper:
             return self._positions[symbol]["exposure_pct"]
         return Decimal("0")
     
-    def get_sector_exposure(self, sector: str) -> Decimal:
-        """Get total exposure percentage for a sector"""
-        return self._sector_exposures.get(sector, Decimal("0"))
+    def get_sector_exposure(self, sector: Union[str, Sector, None] = None) -> Union[Decimal, Dict[Sector, Decimal]]:
+        """
+        Get sector exposure.
+        
+        Args:
+            sector: Optional sector (str or Sector enum). If None, returns all sectors.
+            
+        Returns:
+            If sector specified: Decimal exposure percentage
+            If sector not specified: Dict mapping Sector enum to Decimal
+        """
+        if sector is None:
+            # Return all sectors with Sector enum keys
+            return dict(self._sector_exposures)
+        else:
+            # Convert string to Sector enum if needed
+            if isinstance(sector, str):
+                try:
+                    sector_enum = Sector(sector)
+                except ValueError:
+                    # Try to find by name
+                    for s in Sector:
+                        if s.name == sector or s.value == sector:
+                            sector_enum = s
+                            break
+                    else:
+                        return Decimal("0")
+            else:
+                sector_enum = sector
+            
+            # Return single sector exposure
+            return self._sector_exposures.get(sector_enum, Decimal("0"))
+    
+    def is_concentrated(self, symbol: str = None) -> bool:
+        """
+        Check if a position or any position is concentrated.
+        
+        Args:
+            symbol: Optional symbol to check. If None, checks if any position is concentrated.
+            
+        Returns:
+            True if concentrated, False otherwise
+        """
+        if symbol is not None:
+            # Check specific symbol
+            exposure = self.get_position_exposure(symbol)
+            return exposure >= self.threshold_single
+        else:
+            # Check if any position is concentrated
+            for sym in self._positions:
+                if self.get_position_exposure(sym) >= self.threshold_single:
+                    return True
+            
+            # Check if any sector is concentrated
+            for exposure in self._sector_exposures.values():
+                if exposure >= self.threshold_sector:
+                    return True
+            
+            return False
+    
+    def get_concentrated_risks(self) -> List[ConcentrationFinding]:
+        """
+        Get all concentration risk findings (both position and sector).
+        
+        Returns:
+            List of ConcentrationFinding objects
+        """
+        findings = []
+        
+        # Check position concentrations
+        for symbol, pos_data in self._positions.items():
+            exposure = pos_data["exposure_pct"]
+            if exposure >= self.threshold_single:
+                findings.append(ConcentrationFinding(
+                    symbol=symbol,
+                    exposure_pct=exposure,
+                    threshold_pct=self.threshold_single,
+                    severity="high"
+                ))
+        
+        # Check sector concentrations
+        for sector, exposure in self._sector_exposures.items():
+            if exposure >= self.threshold_sector:
+                findings.append(ConcentrationFinding(
+                    symbol=f"SECTOR:{sector.value}",
+                    exposure_pct=exposure,
+                    threshold_pct=self.threshold_sector,
+                    severity="high"
+                ))
+        
+        return findings
+    
+    def get_position_heatmap(self) -> List[PositionHeatItem]:
+        """
+        Get position heatmap sorted by exposure (descending).
+        
+        Returns:
+            List of PositionHeatItem objects sorted by exposure_pct (highest first)
+        """
+        positions_list = []
+        for symbol, data in self._positions.items():
+            positions_list.append(PositionHeatItem(
+                symbol=symbol,
+                value=data["value"],
+                pnl=data["pnl"],
+                exposure_pct=data["exposure_pct"],
+                heat_score=float(data["exposure_pct"]) / 100.0  # Normalize to 0-1
+            ))
+        
+        # Sort by exposure percentage (descending)
+        return sorted(positions_list, key=lambda x: x.exposure_pct, reverse=True)
     
     def detect_concentrations(self) -> List[ConcentrationFinding]:
         """Detect concentration risks across positions"""
@@ -323,7 +494,7 @@ class PortfolioHeatMapper:
         """Generate heat map with position and sector data"""
         return {
             "positions": dict(self._positions),
-            "sectors": dict(self._sector_exposures),
+            "sectors": {sector.value: exposure for sector, exposure in self._sector_exposures.items()},
             "account_equity": self.account_equity
         }
     
@@ -567,6 +738,60 @@ class PortfolioHeatMapper:
     def get_concentration_alerts(self) -> List[ConcentrationAlert]:
         """Get current concentration alerts."""
         return self.current_alerts
+    
+    def get_concentrations(self) -> List[ConcentrationAlert]:
+        """
+        Alias for get_concentration_alerts() for backward compatibility.
+        
+        Returns:
+            List of concentration alerts
+        """
+        return self.get_concentration_alerts()
+    
+    # ========================================================================
+    # STATISTICS
+    # ========================================================================
+    
+    def get_statistics(self) -> Dict:
+        """
+        Get comprehensive statistics for concentration and exposure.
+        
+        Returns:
+            Dictionary with position and sector statistics
+        """
+        # Count concentrated positions
+        concentrated_positions = sum(
+            1 for sym in self._positions
+            if self.get_position_exposure(sym) >= self.threshold_single
+        )
+        
+        # Count concentrated sectors
+        concentrated_sectors = sum(
+            1 for exposure in self._sector_exposures.values()
+            if exposure >= self.threshold_sector
+        )
+        
+        # Calculate max exposures
+        max_position_exposure = max(
+            (self.get_position_exposure(sym) for sym in self._positions),
+            default=Decimal("0")
+        )
+        
+        max_sector_exposure = max(
+            self._sector_exposures.values(),
+            default=Decimal("0")
+        )
+        
+        return {
+            "total_positions": len(self._positions),
+            "total_sectors": len(self._sector_exposures),
+            "concentrated_positions": concentrated_positions,
+            "concentrated_sectors": concentrated_sectors,
+            "max_position_exposure_pct": str(max_position_exposure),
+            "max_sector_exposure_pct": str(max_sector_exposure),
+            "threshold_single_pct": str(self.threshold_single),
+            "threshold_sector_pct": str(self.threshold_sector)
+        }
     
     # ========================================================================
     # RISK ATTRIBUTION

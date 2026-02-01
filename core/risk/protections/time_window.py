@@ -7,11 +7,11 @@ This is a GLOBAL protection - blocks all trading outside allowed hours.
 Critical for strategies with specific market regime requirements.
 """
 
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timezone, timedelta
 from typing import Optional, List
 from zoneinfo import ZoneInfo
 
-from .base import GlobalProtection, ProtectionResult
+from .base import GlobalProtection, ProtectionResult, ProtectionContext, ProtectionDecision, ProtectionTrigger
 
 
 class TimeWindowProtection(GlobalProtection):
@@ -24,22 +24,28 @@ class TimeWindowProtection(GlobalProtection):
     
     def __init__(
         self,
+        name: Optional[str] = None,
         start_time: time = time(10, 0),
         end_time: time = time(11, 30),
         timezone_str: str = "America/New_York",
-        enabled: bool = True
+        enabled: bool = True,
+        clock=None  # Accept clock kwarg for test compatibility
     ):
         """
         Args:
+            name: Optional custom name (defaults to "TimeWindow")
             start_time: Trading window start (default 10:00)
             end_time: Trading window end (default 11:30)
             timezone_str: Timezone for window (default ET)
             enabled: Whether protection is active
+            clock: Optional clock instance (for testing)
         """
-        super().__init__(name="TimeWindow", enabled=enabled)
+        protection_name = name if name is not None else "TimeWindow"
+        super().__init__(name=protection_name, enabled=enabled)
         self.start_time = start_time
         self.end_time = end_time
         self.timezone = ZoneInfo(timezone_str)
+        self.clock = clock  # Store for potential use
     
     def _check_impl(
         self,
@@ -56,6 +62,7 @@ class TimeWindowProtection(GlobalProtection):
             return ProtectionResult(
                 is_protected=True,
                 reason=f"Outside trading window: {self.start_time.strftime('%H:%M')}-{self.end_time.strftime('%H:%M')} {self.timezone}",
+                trigger=ProtectionTrigger.TIME_WINDOW,
                 metadata={
                     'current_time': current_time.isoformat(),
                     'window_start': self.start_time.isoformat(),
@@ -65,6 +72,29 @@ class TimeWindowProtection(GlobalProtection):
             )
         
         return ProtectionResult(is_protected=False)
+    
+    def check_with_context(self, ctx: ProtectionContext) -> ProtectionDecision:
+        """
+        Check using ProtectionContext (Phase 3 compatible).
+        
+        Args:
+            ctx: Protection context
+            
+        Returns:
+            ProtectionDecision with .allowed attribute
+        """
+        result = self._check_impl(None, None)
+        
+        if result.is_protected:
+            # Return decision with allowed=False (blocked)
+            return ProtectionDecision(
+                allow=False,
+                reason=result.reason,
+                until=result.until
+            )
+        else:
+            # Return decision with allowed=True
+            return ProtectionDecision(allow=True)
     
     def reset(self):
         """No state to reset for time window"""

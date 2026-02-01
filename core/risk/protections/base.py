@@ -1,182 +1,100 @@
-from __future__ import annotations
+"""
+Protection base class and common types.
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone, date
-from decimal import Decimal
-from enum import Enum
-from typing import Any, Dict, List, Optional
+Protections are dynamic circuit breakers that prevent trading
+when certain conditions are met (losing streak, drawdown, etc).
+
+Different from PreTradeRiskGate:
+- RiskGate: Validates each trade (position limits, capital, etc)
+- Protections: Block ALL trading temporarily based on recent performance
+
+Pattern stolen from: Freqtrade protections/
+"""
+
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, date, timedelta, timezone
+from typing import Optional, Dict, List, Any
+from enum import Enum
+from decimal import Decimal
 import logging
 
 logger = logging.getLogger(__name__)
 
 
 class ProtectionTrigger(Enum):
-    """Events that can trigger protection checks."""
-    PRE_TRADE = "pre_trade"
-    PRE_ENTRY = "pre_entry"
-    PRE_EXIT = "pre_exit"
-    POST_TRADE = "post_trade"
-    ON_BAR = "on_bar"
-    ON_TICK = "on_tick"
-    DAILY = "daily"
-    # Legacy triggers from old protections system
+    """Why protection was triggered"""
     STOPLOSS_STREAK = "stoploss_streak"
     MAX_DRAWDOWN = "max_drawdown"
     LOW_PROFIT = "low_profit"
     COOLDOWN_PERIOD = "cooldown_period"
     CONSECUTIVE_LOSSES = "consecutive_losses"
-
-
-@dataclass(frozen=True)
-class ProtectionContext:
-    today: Optional[date] = None
-    account_value: Decimal = Decimal("0")
-    equity_start_of_day: Optional[Decimal] = None
-    now: Optional[datetime] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        # If today not provided but now is, derive today from now
-        if self.today is None and self.now is not None:
-            object.__setattr__(self, 'today', self.now.date())
-        # If today still None, use current date
-        if self.today is None:
-            object.__setattr__(self, 'today', date.today())
-
-    @property
-    def extra(self) -> Dict[str, Any]:
-        return self.metadata
-
-@dataclass(frozen=True)
-class ProtectionDecision:
-    """Return value from a protection check.
-
-    allow=True means trading can proceed.
-    allow=False blocks; reason should be short and machine-friendly.
-    """
-    allow: bool
-    reason: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    VOLATILITY_HALT = "volatility_halt"
+    TIME_WINDOW = "time_window"
+    DAILY_LOSS_LIMIT = "daily_loss_limit"
 
 
 @dataclass
 class ProtectionResult:
-    """Result from protection check (backwards-compatible with old API)."""
+    """Result from protection check"""
     is_protected: bool
     reason: Optional[str] = None
     until: Optional[datetime] = None
     trigger: Optional[ProtectionTrigger] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    
-    # Backwards compatibility with new API (allowed = not is_protected)
-    @property
-    def allowed(self) -> bool:
-        return not self.is_protected
-    
-    # Support old list-based API
-    reasons: List[str] = field(default_factory=list)
-    triggered: List[str] = field(default_factory=list)
+    metadata: Dict = None
     
     def __post_init__(self):
-        # Sync reason to reasons list if provided
-        if self.reason and self.reason not in self.reasons:
-            self.reasons.append(self.reason)
-        # Sync trigger to triggered list if provided
-        if self.trigger and self.trigger.value not in self.triggered:
-            self.triggered.append(self.trigger.value)
-
-    @classmethod
-    def allow(cls) -> "ProtectionResult":
-        return cls(is_protected=False)
-
-    @classmethod
-    def block(
-        cls,
-        reason: str,
-        *,
-        triggered: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> "ProtectionResult":
-        return cls(
-            is_protected=True,
-            reason=reason,
-            metadata=metadata or {},
-        )
-
-    def add_block(
-        self,
-        reason: str,
-        *,
-        triggered: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        self.is_protected = True
-        if reason:
-            self.reason = reason
-            if reason not in self.reasons:
-                self.reasons.append(reason)
-        if triggered and triggered not in self.triggered:
-            self.triggered.append(triggered)
-        if metadata:
-            self.metadata.update(metadata)
-
-    def add_allow(self, *, metadata: Optional[Dict[str, Any]] = None) -> None:
-        if metadata:
-            self.metadata.update(metadata)
+        if self.metadata is None:
+            self.metadata = {}
 
 
-class BaseProtection(ABC):
-    """Base class for protections."""
-
-    name: str = "BaseProtection"
-    triggers: List[ProtectionTrigger] = [ProtectionTrigger.PRE_TRADE]
-
-    def __init__(self) -> None:
-        self.logger = logger
-
-    def should_run(self, trigger: ProtectionTrigger) -> bool:
-        return trigger in set(self.triggers)
-
-    @abstractmethod
-    def check(
-        self,
-        *,
-        trigger: ProtectionTrigger,
-        ctx: Optional[ProtectionContext] = None,
-        symbol: Optional[str] = None,
-        side: Optional[str] = None,
-        quantity: Optional[Decimal] = None,
-        price: Optional[Decimal] = None,
-        signal: Optional[Dict[str, Any]] = None,
-    ) -> ProtectionDecision:
-        raise NotImplementedError
-
-
-# --- Backwards-compatible export expected by core.risk.protections.manager ---
-# Note: Protection is now defined as a standalone class below (see end of file)
-# This provides better backwards compatibility with the legacy API.
+@dataclass
+class ProtectionContext:
+    """
+    Context for protection checks (Phase 3 compatible).
+    
+    Provides information needed by protections to make decisions.
+    """
+    now: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    symbol: Optional[str] = None
+    today: Optional[date] = None
+    account_value: Optional[Decimal] = None
+    metadata: Optional[Dict[str, Any]] = None
+    
+    def __post_init__(self):
+        # Derive today from now if not provided
+        if self.today is None and self.now is not None:
+            self.today = self.now.date()
+        
+        if self.metadata is None:
+            self.metadata = {}
+    
+    @property
+    def extra(self) -> Dict[str, Any]:
+        """Alias for metadata (backwards compatibility)"""
+        return self.metadata
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+@dataclass
+class ProtectionDecision:
+    """
+    Decision from a protection check (Phase 3 compatible).
+    
+    First argument is whether trading is ALLOWED (True = allow, False = block).
+    """
+    allow: bool
+    reason: Optional[str] = None
+    until: Optional[datetime] = None
+    
+    @property
+    def allowed(self) -> bool:
+        """Alias for allow (test compatibility)"""
+        return self.allow
 
-
-def floor_to_day_utc(dt: datetime) -> datetime:
-    return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-
-
-def is_same_utc_day(a: datetime, b: datetime) -> bool:
-    return floor_to_day_utc(a) == floor_to_day_utc(b)
-
-
-# ==============================================================================
-# BACKWARDS-COMPATIBLE PROTECTION CLASSES (Legacy API)
-# ==============================================================================
 
 class Protection(ABC):
     """
-    Base protection class (legacy API for backwards compatibility).
+    Base protection class.
     
     All protections must implement:
     - check(): Returns ProtectionResult
@@ -193,6 +111,7 @@ class Protection(ABC):
         self.enabled = enabled
         self._protected_until: Optional[datetime] = None
         self._last_trigger: Optional[ProtectionTrigger] = None
+        
         logger.info(f"Protection initialized: {name} (enabled={enabled})")
     
     @abstractmethod
@@ -237,7 +156,7 @@ class Protection(ABC):
     
     def _trigger_protection(
         self,
-        duration,  # timedelta
+        duration: timedelta,
         trigger: ProtectionTrigger,
         reason: str,
         metadata: Optional[Dict] = None
@@ -322,12 +241,6 @@ class GlobalProtection(Protection):
     ) -> ProtectionResult:
         """Implement actual check logic"""
         pass
-    
-    def reset(self):
-        """Reset protection state"""
-        self._protected_until = None
-        self._last_trigger = None
-        logger.info(f"Protection reset: {self.name}")
 
 
 class SymbolProtection(Protection):
@@ -389,7 +302,7 @@ class SymbolProtection(Protection):
     def _trigger_symbol_protection(
         self,
         symbol: str,
-        duration,  # timedelta
+        duration: timedelta,
         trigger: ProtectionTrigger,
         reason: str,
         metadata: Optional[Dict] = None
