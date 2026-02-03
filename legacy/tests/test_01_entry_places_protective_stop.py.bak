@@ -1,0 +1,137 @@
+import pytest
+from decimal import Decimal
+
+
+def _calls(exec_engine):
+    """Return recorded exec_engine calls in normalized list form."""
+    calls = getattr(exec_engine, "calls", None)
+    return calls if isinstance(calls, list) else []
+
+
+def _dump_calls(exec_engine):
+    calls = _calls(exec_engine)
+    if not calls:
+        return "[]"
+    out = []
+    for i, item in enumerate(calls, start=1):
+        try:
+            name, kwargs = item
+        except Exception:
+            out.append(f"{i:02d}. {repr(item)}")
+            continue
+        out.append(f"{i:02d}. {name}({kwargs})")
+    return "\n".join(out)
+
+
+def _norm_side(x):
+    if x is None:
+        return ""
+    s = str(x)
+    # handle enums like BrokerOrderSide.BUY -> "BrokerOrderSide.BUY"
+    if "." in s:
+        s = s.split(".")[-1]
+    return s.upper()
+
+
+def _norm_order_type(x):
+    if x is None:
+        return ""
+    s = str(x)
+    if "." in s:
+        s = s.split(".")[-1]
+    return s.upper()
+
+
+def _as_decimal(x):
+    if x is None:
+        return None
+    try:
+        return Decimal(str(x))
+    except Exception:
+        return None
+
+
+@pytest.mark.integration
+def test_entry_places_protective_stop(patch_runtime):
+    """
+    P0 / PATCH2.1 (non-negotiable):
+      When an entry signal includes a stop loss price, system must:
+        1) submit an entry MARKET BUY
+        2) once entry is FILLED, submit a protective STOP SELL using that stop price
+
+    This test asserts observable execution-engine behavior (recorded calls),
+    not fragile internal helper names.
+    """
+
+    stop_px = Decimal("99.50")
+
+    signals = [
+        {
+            "symbol": "SPY",
+            "side": "BUY",
+            "quantity": "1",
+            "order_type": "MARKET",
+            "strategy": "VWAPMicroMeanReversion",
+
+            # runtime may read any of these keys
+            "stop_loss": str(stop_px),
+            "stop_loss_price": str(stop_px),
+            "stop_price": str(stop_px),
+        }
+    ]
+
+    container, exec_engine = patch_runtime(signals)
+    calls = _calls(exec_engine)
+
+    assert calls, (
+        "Exec engine recorded ZERO calls. Runtime never submitted anything.\n\n"
+        "This is almost always harness/config wiring, not strategy logic.\n\n"
+        f"CALL DUMP:\n{_dump_calls(exec_engine)}"
+    )
+
+    # ---- 1) ENTRY MARKET BUY submitted ----
+    entry_calls = []
+    for name, kwargs in calls:
+        if name != "submit_market_order":
+            continue
+        sym = kwargs.get("symbol")
+        side = _norm_side(kwargs.get("side"))
+        qty = kwargs.get("quantity")
+        # quantity may be Decimal/int/str; normalize loosely
+        qty_s = str(qty)
+        if sym == "SPY" and side == "BUY" and qty_s in ("1", "1.0", "1.00", "1.000", "Decimal('1')"):
+            entry_calls.append((name, kwargs))
+
+    assert entry_calls, (
+        "Expected an entry MARKET BUY on SPY with qty=1. Found none.\n\n"
+        f"CALL DUMP:\n{_dump_calls(exec_engine)}"
+    )
+
+    # ---- 2) Protective STOP SELL submitted after fill ----
+    stop_calls = []
+    for name, kwargs in calls:
+        if name != "submit_stop_order":
+            continue
+        sym = kwargs.get("symbol")
+        side = _norm_side(kwargs.get("side"))
+        sp = _as_decimal(kwargs.get("stop_price"))
+        if sym == "SPY" and side == "SELL" and sp == stop_px:
+            stop_calls.append((name, kwargs))
+
+    assert stop_calls, (
+        "Expected a protective STOP SELL on SPY at stop_price=99.50. Found none.\n\n"
+        "If you see the entry but no stop, your runtime either:\n"
+        "- never detected the entry as FILLED\n"
+        "- never found the stop price key on the signal\n"
+        "- or never called submit_stop_order()\n\n"
+        f"CALL DUMP:\n{_dump_calls(exec_engine)}"
+    )
+
+    # Optional: sanity-check stop quantity matches filled qty (=1)
+    # (Don’t make this brittle if your system supports partials later.)
+    stop_qty = stop_calls[-1][1].get("quantity")
+    assert str(stop_qty) in ("1", "1.0", "1.00", "1.000", "Decimal('1')"), (
+        "Protective stop quantity should match filled entry quantity (=1).\n\n"
+        f"STOP CALL:\n{stop_calls[-1]}\n\n"
+        f"CALL DUMP:\n{_dump_calls(exec_engine)}"
+    )

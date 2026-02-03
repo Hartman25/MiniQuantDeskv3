@@ -140,68 +140,67 @@ except InvalidTransitionError as e:
 
 ## PHASE 2: STRATEGY CORRECTNESS - BLOCKING ITEMS
 
+**Gate Script:** `scripts/p2.ps1` (runs P0 → P1 → P2)
+**Tests:** `tests/p2/` (90 tests)
+**Invariants:** `docs/phase2_invariants.md` (16 invariants)
+
 ### 1. VWAP Micro Mean Reversion Validated
 - **Implementation:** ✅ EXISTS - `strategies/vwap_micro_mean_reversion.py`
-- **Test:** ❌ FAILING - 7 tests in `test_phase2_strategy_correctness.py`
-- **Docs:** ⚠️ PARTIAL - Strategy has docstring
-- **Status:** 🟡 BLOCKED BY P0
+- **Test:** ✅ PASSING - `tests/p2/test_vwap_correctness.py` (11 tests)
+- **Docs:** ✅ `docs/phase2_invariants.md` P2-INV-01 through P2-INV-04
+- **Status:** 🟢 COMPLETE
 
 ---
 
 ### 2. Explicit NO-TRADE Conditions
-- **Implementation:** ✅ EXISTS - In strategy code
-- **Test:** ❌ FAILING - Covered by Phase 2 acceptance tests
-- **Docs:** ⚠️ IN CODE
-- **Status:** 🟡 BLOCKED BY P0
+- **Implementation:** ✅ EXISTS - `strategies/no_trade_filter.py`
+- **Test:** ✅ PASSING - `tests/p2/test_no_trade_filter.py` (23 tests)
+- **Docs:** ✅ `docs/phase2_invariants.md` P2-INV-05 through P2-INV-08
+- **Status:** 🟢 COMPLETE
 
 **Implemented:**
-- Warmup period (vwap_min_bars)
-- Time window (10:00-11:30 ET)
-- Max trades per day
-- Daily loss limit
+- `NoTradeFilterConfig` + `check_no_trade()` pure function
+- Reason codes: OUTSIDE_SESSION, BLACKOUT_NEAR_OPEN/CLOSE, MAX_TRADES_REACHED, DAILY_LOSS_LIMIT, COOLDOWN_AFTER_STOP, WARMUP_INCOMPLETE, VOLATILITY_SPIKE, REGIME_NOT_ALLOWED
 
 ---
 
 ### 3. Max Time-in-Trade Enforcement
-- **Implementation:** ❌ MISSING
-- **Test:** ❌ MISSING
-- **Docs:** ❌ MISSING
-- **Status:** 🔴 NOT STARTED
-
-**Required Implementation:**
-- Add `max_holding_minutes` config parameter
-- Track entry time in Position
-- Force exit after max time elapsed
-- Add to Phase 2 acceptance tests
+- **Implementation:** ✅ EXISTS - `strategies/vwap_micro_mean_reversion.py` (`max_time_in_trade_minutes` config)
+- **Test:** ✅ PASSING - `tests/p2/test_max_time_in_trade.py` (5 tests)
+- **Docs:** ✅ `docs/phase2_invariants.md` P2-INV-09, P2-INV-10
+- **Status:** 🟢 COMPLETE
 
 ---
 
 ### 4. Known Failure Regimes Documented
-- **Implementation:** N/A (documentation task)
-- **Test:** N/A
-- **Docs:** ❌ MISSING
-- **Status:** 🔴 NOT STARTED
-
-**Required Documentation:**
-- Add to strategy docstring:
-  - Low volatility regimes (tight VWAP bands)
-  - Gap days (price disconnected from VWAP)
-  - News events (abnormal volatility)
-  - Low volume periods
+- **Implementation:** ✅ `strategies/regime_detection.py` (trend day, vol spike heuristics)
+- **Test:** ✅ PASSING - `tests/p2/test_failure_regimes.py` (11 tests)
+- **Docs:** ✅ `docs/phase2_failure_regimes.md`
+- **Status:** 🟢 COMPLETE
 
 ---
 
 ### 5. Strategy Retirement Rules
-- **Implementation:** ❌ MISSING
-- **Test:** ❌ MISSING
-- **Docs:** ❌ MISSING
-- **Status:** 🔴 NOT STARTED
+- **Implementation:** ✅ EXISTS - `strategies/retirement.py`
+- **Test:** ✅ PASSING - `tests/p2/test_retirement.py` (10 tests)
+- **Docs:** ✅ `docs/phase2_invariants.md` P2-INV-12, P2-INV-13
+- **Status:** 🟢 COMPLETE
 
-**Required Implementation:**
-- Win rate threshold (e.g., < 40% over 30 trades)
-- Drawdown threshold (e.g., > 20% from peak)
-- Auto-disable flag
-- Add to strategy base class
+---
+
+### 6. Signal vs Execution Attribution
+- **Implementation:** ✅ EXISTS - `core/analytics/attribution.py` (extended), `core/analytics/performance.py` (signal_time, signal_price, slippage)
+- **Test:** ✅ PASSING - `tests/p2/test_attribution.py` (18 tests)
+- **Docs:** ✅ `docs/phase2_invariants.md` P2-INV-14 through P2-INV-16
+- **Status:** 🟢 COMPLETE
+
+---
+
+### 7. Offline Optimization Scaffolding
+- **Implementation:** ✅ EXISTS - `strategies/offline/time_of_day.py`, `strategies/offline/param_sensitivity.py`
+- **Test:** ✅ PASSING - `tests/p2/test_offline_analytics.py` (12 tests)
+- **Docs:** ✅ In module docstrings (offline-only, no live impact)
+- **Status:** 🟢 COMPLETE
 
 ---
 
@@ -308,11 +307,13 @@ cd C:\Users\Zacha\Desktop\2
 - 🔴 Missing: 1 (invariant halt)
 - **Progress: 0/6** ❌
 
-### Phase 2 Blocking (5 items)
-- ✅ Complete: 0
-- 🟡 Partial: 2 (blocked by P0)
-- 🔴 Missing: 3
-- **Progress: 0/5** ❌
+### Phase 2 Blocking (7 items)
+- ✅ Complete: 7
+- 🟡 Partial: 0
+- 🔴 Missing: 0
+- **Progress: 7/7** ✅
+- **Gate Script:** `scripts/p2.ps1`
+- **Test Count:** 90 tests in `tests/p2/`
 
 ### Phase 3 Blocking (5 items)
 - ✅ Complete: 0
