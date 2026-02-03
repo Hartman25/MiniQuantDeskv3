@@ -490,6 +490,67 @@ class TradeAttributionAnalyzer:
             if start_date <= t.exit_time <= end_date
         ]
         return filtered
+
+    # ========================================================================
+    # LIST-BASED ATTRIBUTION (P2-INV-14: deterministic ordering)
+    # ========================================================================
+
+    def get_attribution_list(
+        self,
+        dimension: str = "strategy",
+    ) -> List[AttributionBreakdown]:
+        """
+        Get attribution as a sorted list (deterministic ordering by subcategory).
+
+        Args:
+            dimension: "strategy", "symbol", "time_of_day", or "signal_type"
+
+        Returns:
+            List of AttributionBreakdown sorted by subcategory name.
+            Empty list if no trades.
+        """
+        dispatch = {
+            "strategy": self.get_attribution_by_strategy,
+            "symbol": self.get_attribution_by_symbol,
+            "time_of_day": self.get_attribution_by_time_of_day,
+            "signal_type": self.get_attribution_by_signal_type,
+        }
+        getter = dispatch.get(dimension)
+        if getter is None:
+            return []
+        result = getter()
+        return sorted(result.values(), key=lambda b: b.subcategory)
+
+    def get_slippage_summary(self) -> Dict[str, Decimal]:
+        """
+        Compute aggregate slippage metrics across all trades.
+
+        Returns dict with:
+          - avg_entry_slippage: average (entry_price - signal_price)
+          - total_slippage_cost: sum of entry_slippage * quantity across trades
+          - trade_count_with_slippage: number of trades with signal_price data
+        """
+        slippages = []
+        total_cost = Decimal("0")
+        for t in self.trades:
+            slip = t.entry_slippage
+            if slip is not None:
+                slippages.append(slip)
+                total_cost += slip * t.quantity
+
+        if not slippages:
+            return {
+                "avg_entry_slippage": Decimal("0"),
+                "total_slippage_cost": Decimal("0"),
+                "trade_count_with_slippage": 0,
+            }
+
+        return {
+            "avg_entry_slippage": sum(slippages) / len(slippages),
+            "total_slippage_cost": total_cost,
+            "trade_count_with_slippage": len(slippages),
+        }
+
 # --- PATCH: restore AttributionMetrics symbol expected by core.analytics.__init__ / tests ---
 
 

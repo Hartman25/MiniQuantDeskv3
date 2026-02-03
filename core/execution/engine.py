@@ -283,6 +283,8 @@ class OrderExecutionEngine:
                 
                 return broker_order_id
                 
+            except OrderValidationError:
+                raise  # Let validation errors propagate without wrapping
             except Exception as e:
                 self.logger.error(
                     "Order submission failed",
@@ -293,7 +295,7 @@ class OrderExecutionEngine:
                     },
                     exc_info=True
                 )
-                
+
                 ids = self._trade_ids(internal_order_id)
                 self._j_emit(build_trade_event(
                     event_type="ERROR",
@@ -310,9 +312,9 @@ class OrderExecutionEngine:
                     to_state=OrderStatus.REJECTED,
                     reason=str(e)
                 )
-                
+
                 raise OrderExecutionError(f"Failed to submit order: {e}") from e
-    
+
     def submit_limit_order(
         self,
         internal_order_id: str,
@@ -431,6 +433,8 @@ class OrderExecutionEngine:
 
                 return broker_order_id
 
+            except OrderValidationError:
+                raise  # Let validation errors propagate without wrapping
             except Exception as e:
                 self.logger.error(
                     "Limit order submission failed",
@@ -546,6 +550,8 @@ class OrderExecutionEngine:
 
                 return broker_order_id
 
+            except OrderValidationError:
+                raise  # Let validation errors propagate without wrapping
             except Exception as e:
                 self.logger.error(
                     "Stop order submission failed",
@@ -923,6 +929,11 @@ class OrderExecutionEngine:
 
 class OrderExecutionError(Exception):
     """Order execution error."""
+    pass
+
+
+class OrderValidationError(OrderExecutionError):
+    """Raised when pre-submission order validation fails."""
     pass
 
 
