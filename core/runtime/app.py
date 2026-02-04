@@ -263,6 +263,7 @@ def _emit_limit_ttl_cancel_event(
     *,
     journal,
     run_id: str | None,
+    trade_id: str,
     internal_order_id: str,
     broker_order_id: str,
     symbol: str,
@@ -282,6 +283,7 @@ def _emit_limit_ttl_cancel_event(
         "event": "ORDER_TTL_CANCEL",
         "ts_utc": _utc_iso(),
         "run_id": run_id,
+        "trade_id": trade_id,
         "internal_order_id": internal_order_id,
         "broker_order_id": broker_order_id,
         "symbol": symbol,
@@ -897,6 +899,7 @@ def run(opts: RunOptions) -> int:
                             journal.write_event(
                                 {
                                     "event": "order_submitted",
+                                    "trade_id": trade_id,
                                     "internal_order_id": internal_id,
                                     "broker_order_id": broker_order_id,
                                     "symbol": sig_symbol,
@@ -936,6 +939,7 @@ def run(opts: RunOptions) -> int:
                                 _emit_limit_ttl_cancel_event(
                                     journal=journal,
                                     run_id=run_id_opt if isinstance(run_id_opt, str) else None,
+                                    trade_id=trade_id,
                                     internal_order_id=internal_id,
                                     broker_order_id=broker_order_id,
                                     symbol=sig_symbol,

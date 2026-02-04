@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Iterator
 
 
 SCHEMA_VERSION = "1.0.0"
@@ -83,13 +83,28 @@ class TradeJournal:
         self._fh = open(path, "a", encoding="utf-8")
         self._current_day = day
 
+
+    def _validate_event(self, event: Dict[str, Any]) -> None:
+        # Patch 2: enforce joinable correlation IDs for every TradeJournal event.
+        et = event.get("event_type")
+        if not et:
+            raise ValueError("TradeJournal event missing required field: event_type")
+
+        missing = [k for k in ("trade_id", "internal_order_id") if not event.get(k)]
+        if missing:
+            raise ValueError(f"TradeJournal event missing required correlation fields: {missing}. event_type={et}")
+
     def emit(self, event: Dict[str, Any]) -> None:
         """
-        Write one event line. Enforces schema_version + ts_utc.
+        Write one event line. Enforces:
+          - schema_version + ts_utc
+          - Patch 2 correlation IDs: trade_id + internal_order_id + event_type
         """
         e = dict(event)
         e["schema_version"] = SCHEMA_VERSION
         e.setdefault("ts_utc", utc_now_iso())
+
+        self._validate_event(e)
 
         line = _compact_json(e)
 
@@ -98,6 +113,29 @@ class TradeJournal:
             assert self._fh is not None
             self._fh.write(line + "\n")
             self._fh.flush()
+
+    def iter_events(self) -> Iterator[Dict[str, Any]]:
+        """Iterate all journaled trade events (across daily JSONL files)."""
+        if not self.trades_dir.exists():
+            return iter(())
+
+        def _gen() -> Iterator[Dict[str, Any]]:
+            for path in sorted(self.trades_dir.glob("*.jsonl")):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                yield json.loads(line)
+                            except Exception:
+                                continue
+                except FileNotFoundError:
+                    continue
+
+        return _gen()
+
 
 
 def build_trade_event(
@@ -139,3 +177,4 @@ def build_trade_event(
         "local_ts_utc": utc_now_iso(),
         "error": error,
     }
+

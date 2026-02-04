@@ -95,6 +95,7 @@ class OrderExecutionEngine:
         self.trade_journal: Optional[TradeJournal] = None
         self._run_id: str = TradeJournal.new_run_id()
         self._trade_ids_by_internal: Dict[str, str] = {}
+        self.transaction_log = transaction_log  # Patch 2: durable correlation log (optional)
 
         # Track order metadata
         self._order_metadata: Dict[str, Dict] = {}
@@ -115,7 +116,8 @@ class OrderExecutionEngine:
         the in-memory duplicate-order guard after a restart."""
         try:
             for event in transaction_log.iter_events():
-                if event.get("event_type") == "ORDER_SUBMIT":
+                et = event.get("event_type") or event.get("event")
+                if str(et).upper() == "ORDER_SUBMIT":
                     oid = event.get("internal_order_id")
                     if oid:
                         self._submitted_order_ids.add(oid)
@@ -250,6 +252,34 @@ class OrderExecutionEngine:
                 ))
 
                 # PATCH 2: Mark as submitted (prevent re-submission)
+                # Patch 2: append durable transaction log event (order submit)
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append({
+                            "event_type": "ORDER_SUBMIT",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id,
+                            "symbol": symbol,
+                            "side": side.value,
+                            "qty": str(quantity),
+                            "order_type": "MARKET",
+                            "strategy": strategy,
+                        })
+                        self.transaction_log.append({
+                            "event_type": "BROKER_ORDER_ACK",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id,
+                            "symbol": symbol,
+                            "ack": True,
+                        })
+                    except Exception:
+                        # transaction log must never kill execution
+                        pass
+
                 self._submitted_order_ids.add(internal_order_id)
                 
                 # NEW: Track order in OrderTracker
@@ -306,6 +336,30 @@ class OrderExecutionEngine:
                 ))
 
                 # Transition to REJECTED
+                # Patch 2: durable transaction log error/reject
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append({
+                            "event_type": "ERROR",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id if "broker_order_id" in locals() else None,
+                            "symbol": symbol if "symbol" in locals() else None,
+                            "error": str(e),
+                        })
+                        self.transaction_log.append({
+                            "event_type": "ORDER_REJECTED",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id if "broker_order_id" in locals() else None,
+                            "symbol": symbol if "symbol" in locals() else None,
+                            "reason": str(e),
+                        })
+                    except Exception:
+                        pass
+
                 self.state_machine.transition(
                     order_id=internal_order_id,
                     from_state=OrderStatus.PENDING,
@@ -406,6 +460,34 @@ class OrderExecutionEngine:
                 ))
 
                 self._submitted_order_ids.add(internal_order_id)
+                # Patch 2: append durable transaction log event (order submit)
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append({
+                            "event_type": "ORDER_SUBMIT",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id,
+                            "symbol": symbol,
+                            "side": side.value,
+                            "qty": str(quantity),
+                            "order_type": "LIMIT",
+                            "limit_price": str(limit_price),
+                            "strategy": strategy,
+                        })
+                        self.transaction_log.append({
+                            "event_type": "BROKER_ORDER_ACK",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id,
+                            "symbol": symbol,
+                            "ack": True,
+                        })
+                    except Exception:
+                        pass
+
 
                 # Track order in OrderTracker
                 if self.order_tracker:
@@ -450,6 +532,30 @@ class OrderExecutionEngine:
                     symbol=symbol if "symbol" in locals() else None,
                     error={"where": "OrderExecutionEngine", "message": str(e)},
                 ))
+
+                # Patch 2: durable transaction log error/reject (limit submit)
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append({
+                            "event_type": "ERROR",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id if "broker_order_id" in locals() else None,
+                            "symbol": symbol if "symbol" in locals() else None,
+                            "error": str(e),
+                        })
+                        self.transaction_log.append({
+                            "event_type": "ORDER_REJECTED",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id if "broker_order_id" in locals() else None,
+                            "symbol": symbol if "symbol" in locals() else None,
+                            "reason": str(e),
+                        })
+                    except Exception:
+                        pass
 
                 self.state_machine.transition(
                     order_id=internal_order_id,
@@ -591,6 +697,21 @@ class OrderExecutionEngine:
                 ))
 
                 # Transition to CANCELLED (best-effort; if already terminal, ignore)
+                # Patch 2: durable transaction log cancel
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append({
+                            "event_type": "ORDER_CANCEL",
+                            "run_id": ids.run_id,
+                            "trade_id": ids.trade_id,
+                            "internal_order_id": internal_order_id,
+                            "broker_order_id": broker_order_id,
+                            "symbol": self._order_metadata.get(internal_order_id, {}).get("symbol"),
+                            "reason": reason,
+                        })
+                    except Exception:
+                        pass
+
                 try:
                     order = self.state_machine.get_order(internal_order_id)
                     from_state = order.state if order else OrderStatus.SUBMITTED
@@ -800,6 +921,23 @@ class OrderExecutionEngine:
                 f"{filled_qty} @ ${fill_price}",
                 extra={"internal_order_id": internal_order_id}
             )
+
+            # Patch 2: durable transaction log fill
+            if self.transaction_log is not None:
+                try:
+                    ids = self._trade_ids(internal_order_id)
+                    self.transaction_log.append({
+                        "event_type": "ORDER_FILLED",
+                        "run_id": ids.run_id,
+                        "trade_id": ids.trade_id,
+                        "internal_order_id": internal_order_id,
+                        "broker_order_id": broker_order_id,
+                        "symbol": self._order_metadata.get(internal_order_id, {}).get("symbol"),
+                        "filled_qty": str(filled_qty),
+                        "fill_price": str(fill_price),
+                    })
+                except Exception:
+                    pass
         
         # If filled, create/update position
         if to_state == OrderStatus.FILLED and filled_qty and fill_price:

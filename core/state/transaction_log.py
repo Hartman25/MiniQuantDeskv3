@@ -86,6 +86,7 @@ class TransactionLog:
     # ------------------------
     # Write path
     # ------------------------
+
     def append(self, event: EventLike) -> None:
         """
         Append an event to the log as a single JSON line.
@@ -94,6 +95,11 @@ class TransactionLog:
           - a dict
           - a dataclass instance (will be converted via asdict)
           - an object with to_dict() method
+
+        Patch 2 (correlation IDs):
+          - If the event represents an order lifecycle event (ORDER_*, CANCEL, FILL, ERROR, BROKER_ORDER_ACK),
+            we REQUIRE: event_type, trade_id, internal_order_id.
+          - If a caller uses legacy key 'event' instead of 'event_type', we map it.
         """
         with self._lock:
             if self._file is None:
@@ -101,6 +107,22 @@ class TransactionLog:
 
             try:
                 event_dict = self._to_dict(event)
+
+                # Back-compat: allow legacy 'event' key (used by some writers)
+                if "event_type" not in event_dict and "event" in event_dict:
+                    event_dict["event_type"] = event_dict.get("event")
+
+                event_type = str(event_dict.get("event_type") or "").upper().strip()
+
+                # Enforce correlation IDs for order-relevant events only.
+                needs_corr = bool(
+                    event_type.startswith("ORDER_")
+                    or event_type in {"CANCEL", "FILL", "ERROR", "BROKER_ORDER_ACK", "BROKER_ACK", "ORDER_ACK"}
+                )
+                if needs_corr:
+                    missing = [k for k in ("event_type", "trade_id", "internal_order_id") if not event_dict.get(k)]
+                    if missing:
+                        raise ValueError(f"TransactionLog event missing required fields: {missing}")
 
                 # Inject a log timestamp (UTC, ISO8601 with Z)
                 logged_at = self.clock.now()
