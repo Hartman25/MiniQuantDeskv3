@@ -180,7 +180,8 @@ class Container:
         self._data_pipeline = MarketDataPipeline(
             alpaca_api_key=self._config.broker.api_key,
             alpaca_api_secret=self._config.broker.api_secret,
-            max_staleness_seconds=self._config.data.max_staleness_seconds
+            max_staleness_seconds=self._config.data.max_staleness_seconds,
+            throttler=self._throttler,
         )
         
         # 7. Initialize risk components

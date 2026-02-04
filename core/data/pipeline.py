@@ -14,8 +14,9 @@ Based on LEAN's DataFeed architecture.
 
 from typing import Optional, List, Dict
 from decimal import Decimal
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import threading
+import time
 from dataclasses import dataclass
 from enum import Enum
 
@@ -25,6 +26,7 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 from core.logging import get_logger, LogStream
+from core.net.throttler import Throttler, ExponentialBackoff
 
 
 # ============================================================================
@@ -103,13 +105,18 @@ class MarketDataPipeline:
         alpaca_api_secret: str,
         polygon_api_key: Optional[str] = None,
         max_staleness_seconds: int = 90,
-        cache_ttl_seconds: int = 30
+        cache_ttl_seconds: int = 30,
+        throttler: Optional[Throttler] = None,
     ):
         """Initialize data pipeline."""
         self.logger = get_logger(LogStream.DATA)
         self.max_staleness = timedelta(seconds=max_staleness_seconds)
         self.cache_ttl = timedelta(seconds=cache_ttl_seconds)
         
+        # Throttler (optional). If present, ALL external calls must pass through it.
+        self._throttler: Optional[Throttler] = throttler
+        self._backoff = ExponentialBackoff(base=1.0, multiplier=2.0, max_delay=10.0, jitter=True)
+
         # Alpaca client
         self.alpaca_client = StockHistoricalDataClient(
             api_key=alpaca_api_key,
@@ -206,9 +213,9 @@ class MarketDataPipeline:
         # Calculate start time
         # Rough estimate: 1Min = 1 bar per minute during market hours (6.5 hours = 390 mins)
         if timeframe == "1Min":
-            start = datetime.now() - timedelta(days=max(1, lookback_bars // 390 + 1))
+            start = datetime.now(timezone.utc) - timedelta(days=max(1, lookback_bars // 390 + 1))
         else:
-            start = datetime.now() - timedelta(days=lookback_bars)
+            start = datetime.now(timezone.utc) - timedelta(days=lookback_bars)
         
         # Build request
         request = StockBarsRequest(
@@ -220,7 +227,37 @@ class MarketDataPipeline:
         # Fetch
         self.logger.debug(f"Fetching {lookback_bars} bars for {symbol} from Alpaca")
         
-        bars = self.alpaca_client.get_stock_bars(request)
+        # Fetch with throttling + bounded retry/backoff (fail-closed)
+        def _do_call():
+            return self.alpaca_client.get_stock_bars(request)
+
+        last_err: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                if self._throttler is not None:
+                    bars = self._throttler.execute_sync('alpaca_data', _do_call)
+                else:
+                    bars = _do_call()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e).lower()
+                is_rate = ('429' in msg) or ('rate limit' in msg) or ('too many request' in msg)
+                is_transient = is_rate or ('timeout' in msg) or ('temporar' in msg) or ('connection' in msg)
+                if attempt < 2 and is_transient:
+                    delay = self._backoff.next_delay(attempt)
+                    self.logger.warning(
+                        'Alpaca bars fetch failed (transient), backing off',
+                        extra={'symbol': symbol, 'attempt': attempt + 1, 'delay_s': round(delay, 2), 'error': str(e)}
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+
+        if last_err is not None:
+            raise DataPipelineError(f'Alpaca bars fetch failed: {last_err}')
+
         
         if symbol not in bars:
             return pd.DataFrame()

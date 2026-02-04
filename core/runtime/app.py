@@ -34,6 +34,7 @@ from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus
 from core.recovery.persistence import StatePersistence
 from core.data.contract import MarketDataContract
 from core.data.validator import DataValidator
+from core.data.pipeline import DataPipelineError
 from core.di.container import Container
 from core.execution.engine import OrderExecutionEngine
 from core.journal.trade_journal import TradeJournal
@@ -263,7 +264,6 @@ def _emit_limit_ttl_cancel_event(
     *,
     journal,
     run_id: str | None,
-    trade_id: str,
     internal_order_id: str,
     broker_order_id: str,
     symbol: str,
@@ -283,7 +283,6 @@ def _emit_limit_ttl_cancel_event(
         "event": "ORDER_TTL_CANCEL",
         "ts_utc": _utc_iso(),
         "run_id": run_id,
-        "trade_id": trade_id,
         "internal_order_id": internal_order_id,
         "broker_order_id": broker_order_id,
         "symbol": symbol,
@@ -452,6 +451,7 @@ def run(opts: RunOptions) -> int:
 
         risk_manager = container.get_risk_manager()
         data_validator = container.get_data_validator()
+        data_pipeline = container.get_data_pipeline()
         position_store = container.get_position_store()  # FIX: Get before use in guards
 
         # ===============================================================
@@ -614,7 +614,16 @@ def run(opts: RunOptions) -> int:
                     timeframe = "1Min"
                     lookback = 120
 
-                    df = broker.get_bars(symbol=symbol, timeframe=timeframe, limit=lookback)
+                    try:
+                        df = data_pipeline.get_latest_bars(symbol, lookback_bars=lookback, timeframe=timeframe)
+                    except DataPipelineError as e:
+                        journal.write_event({'event': 'market_data_block', 'symbol': symbol, 'reason': str(e)})
+                        logger.warning('Market data blocked; skipping symbol', extra={'symbol': symbol, 'error': str(e)})
+                        continue
+                    except Exception as e:
+                        journal.write_event({'event': 'market_data_error', 'symbol': symbol, 'error': str(e)})
+                        logger.exception('Market data error; skipping symbol', extra={'symbol': symbol})
+                        continue
                     bars = _df_to_contracts(symbol, df)
 
                     data_validator.validate_bars(bars=bars, timeframe=timeframe)
@@ -899,7 +908,6 @@ def run(opts: RunOptions) -> int:
                             journal.write_event(
                                 {
                                     "event": "order_submitted",
-                                    "trade_id": trade_id,
                                     "internal_order_id": internal_id,
                                     "broker_order_id": broker_order_id,
                                     "symbol": sig_symbol,
@@ -939,7 +947,6 @@ def run(opts: RunOptions) -> int:
                                 _emit_limit_ttl_cancel_event(
                                     journal=journal,
                                     run_id=run_id_opt if isinstance(run_id_opt, str) else None,
-                                    trade_id=trade_id,
                                     internal_order_id=internal_id,
                                     broker_order_id=broker_order_id,
                                     symbol=sig_symbol,
