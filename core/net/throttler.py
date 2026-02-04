@@ -9,6 +9,7 @@ Pattern stolen from: Hummingbot async_utils.py
 
 import asyncio
 import time
+import threading
 from collections import deque, defaultdict
 from typing import Dict, Tuple, Callable, Any, Optional
 from dataclasses import dataclass
@@ -58,6 +59,8 @@ class Throttler:
         self._rate_limits = rate_limits
         self._request_times: Dict[str, deque] = defaultdict(deque)
         self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # Sync locks for execute_sync()
+        self._sync_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
         
         # Statistics
         self._total_requests: Dict[str, int] = defaultdict(int)
@@ -112,7 +115,90 @@ class Throttler:
                 )
                 raise
     
-    async def _wait_if_needed(self, limit_id: str) -> float:
+    
+    def execute_sync(
+        self,
+        limit_id: str,
+        func: Callable,
+        *args,
+        **kwargs
+    ) -> Any:
+        """
+        Synchronous wrapper for rate-limited execution.
+
+        WHY THIS EXISTS:
+        - The runtime loop and most connectors in this repo are synchronous.
+        - We still want a SINGLE throttling implementation.
+        - This method uses time.sleep() and a thread lock per limit_id.
+
+        NOTE:
+        - Do NOT call this from inside an active asyncio event loop.
+        """
+        # If called inside a running event loop, force the caller to use execute()
+        try:
+            loop = asyncio.get_running_loop()
+            if loop and loop.is_running():
+                raise RuntimeError(
+                    "execute_sync() called inside an active event loop. "
+                    "Use await throttler.execute(...) instead."
+                )
+        except RuntimeError:
+            # no running loop -> OK
+            pass
+
+        with self._sync_locks[limit_id]:
+            self._wait_if_needed_sync(limit_id)
+
+            now = time.time()
+            self._request_times[limit_id].append(now)
+            self._total_requests[limit_id] += 1
+
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger.error(
+                    f"Throttled sync call failed: {limit_id}",
+                    extra={'error': str(e), 'func': getattr(func, '__name__', str(func))}
+                )
+                raise
+
+    def _wait_if_needed_sync(self, limit_id: str) -> float:
+        """Synchronous wait-if-needed. Returns waited seconds."""
+        if limit_id not in self._rate_limits:
+            return 0.0
+
+        limit = self._rate_limits[limit_id]
+        request_times = self._request_times[limit_id]
+
+        now = time.time()
+        cutoff_time = now - limit.time_window
+
+        while request_times and request_times[0] < cutoff_time:
+            request_times.popleft()
+
+        if len(request_times) >= limit.max_requests:
+            oldest_request = request_times[0]
+            wait_time = (oldest_request + limit.time_window) - now
+
+            if wait_time > 0:
+                logger.warning(
+                    f"Rate limit reached for {limit_id}, waiting {wait_time:.2f}s (sync)",
+                    extra={
+                        'limit_id': limit_id,
+                        'wait_time': wait_time,
+                        'limit': str(limit),
+                        'current_requests': len(request_times)
+                    }
+                )
+                self._total_waits[limit_id] += 1
+                self._total_wait_time[limit_id] += wait_time
+                time.sleep(wait_time)
+                return wait_time
+
+        return 0.0
+
+
+async def _wait_if_needed(self, limit_id: str) -> float:
         """
         Wait if at rate limit.
         

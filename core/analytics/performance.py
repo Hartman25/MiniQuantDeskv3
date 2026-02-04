@@ -51,14 +51,25 @@ class TradeResult:
     duration_hours: float
     strategy: Optional[str] = None
     signal_type: Optional[str] = None
-    
+
+    # Phase 2 (P2-INV-15): Signal vs execution timing + slippage
+    signal_time: Optional[datetime] = None   # when strategy decided to trade
+    signal_price: Optional[Decimal] = None   # price at signal generation
+
     def is_winner(self) -> bool:
         """Check if trade was profitable."""
         return self.pnl > 0
-    
+
+    @property
+    def entry_slippage(self) -> Optional[Decimal]:
+        """Slippage = entry_price - signal_price (positive = adverse)."""
+        if self.signal_price is not None:
+            return self.entry_price - self.signal_price
+        return None
+
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
-        return {
+        d = {
             "symbol": self.symbol,
             "entry_time": self.entry_time.isoformat(),
             "exit_time": self.exit_time.isoformat(),
@@ -71,8 +82,15 @@ class TradeResult:
             "commission": str(self.commission),
             "duration_hours": round(self.duration_hours, 2),
             "strategy": self.strategy,
-            "signal_type": self.signal_type
+            "signal_type": self.signal_type,
         }
+        if self.signal_time is not None:
+            d["signal_time"] = self.signal_time.isoformat()
+        if self.signal_price is not None:
+            d["signal_price"] = str(self.signal_price)
+        if self.entry_slippage is not None:
+            d["entry_slippage"] = str(self.entry_slippage)
+        return d
 
 
 # ============================================================================

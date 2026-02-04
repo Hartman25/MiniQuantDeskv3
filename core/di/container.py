@@ -180,7 +180,8 @@ class Container:
         self._data_pipeline = MarketDataPipeline(
             alpaca_api_key=self._config.broker.api_key,
             alpaca_api_secret=self._config.broker.api_secret,
-            max_staleness_seconds=self._config.data.max_staleness_seconds
+            max_staleness_seconds=self._config.data.max_staleness_seconds,
+            throttler=self._throttler,
         )
         
         # 7. Initialize risk components
@@ -344,7 +345,7 @@ class Container:
     def set_broker_connector(self, connector) -> None:
         """
         Set broker connector and initialize market/realtime features.
-        
+
         This completes the initialization by setting up:
         1. Broker reconciler
         2. Symbol properties cache (NEW)
@@ -352,7 +353,7 @@ class Container:
         4. User stream tracker (NEW)
         """
         self._broker_connector = connector
-        
+
         # Create reconciler
         if self._position_store and self._order_machine:
             self._reconciler = BrokerReconciler(
@@ -361,15 +362,15 @@ class Container:
                 order_machine=self._order_machine
             )
             logger.info("Broker reconciler created")
-        
+
         # NEW: Initialize symbol properties cache
         self._symbol_props_cache = SymbolPropertiesCache(connector)
         logger.info("Symbol properties cache initialized")
-        
+
         # NEW: Initialize security cache
         self._security_cache = SecurityCache(self._symbol_props_cache)
         logger.info("Security cache initialized")
-        
+
         # NEW: Initialize order execution engine
         if self._order_machine and self._position_store:
             self._execution_engine = OrderExecutionEngine(
@@ -377,10 +378,15 @@ class Container:
                 state_machine=self._order_machine,
                 position_store=self._position_store,
                 symbol_properties=self._symbol_props_cache,  # Pass symbol properties for validation
-                order_tracker=self._order_tracker  # NEW: Pass order tracker for fill tracking
+                order_tracker=self._order_tracker,  # NEW: Pass order tracker for fill tracking
+
+                # PATCH 1 (CRITICAL):
+                # Ensure crash/restart dedupe is ACTIVE in production by seeding
+                # from the persistent transaction log.
+                transaction_log=self._transaction_log,
             )
-            logger.info("Order execution engine initialized with symbol properties + order tracker")
-        
+            logger.info("Order execution engine initialized with symbol properties + order tracker + transaction log")
+
         # NEW: Initialize user stream tracker
         if self._config:
             self._user_stream = UserStreamTracker(
@@ -388,11 +394,11 @@ class Container:
                 api_secret=self._config.broker.api_secret,
                 is_paper=self._config.broker.paper_trading  # FIXED: was .account.mode
             )
-            
+
             # Wire user stream to order tracker
             self._user_stream.on_trade_update(self._handle_trade_update)
             self._user_stream.on_account_update(self._handle_account_update)
-            
+
             logger.info(f"User stream tracker initialized (paper={self._config.broker.paper_trading})")
     
     async def _handle_trade_update(self, update: dict):

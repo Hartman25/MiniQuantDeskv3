@@ -93,6 +93,9 @@ class VWAPMicroMeanReversion(IStrategy):
         self.entry_limit_offset_bps = int(config.get("entry_limit_offset_bps", 0))
         self.entry_limit_ttl_seconds = int(config.get("entry_limit_ttl_seconds", 90))
 
+        # Max time-in-trade: 0 = disabled (P2-INV-09)
+        self.max_time_in_trade_minutes = int(config.get("max_time_in_trade_minutes", 0))
+
         # VWAP state
         self._vwap = _VWAPState()
 
@@ -106,6 +109,7 @@ class VWAPMicroMeanReversion(IStrategy):
         self._in_position = False
         self._entry_price: Optional[Decimal] = None
         self._entry_qty: Optional[Decimal] = None
+        self._entry_time: Optional[datetime] = None  # bar timestamp at entry (P2-INV-09)
         self._last_entry_reason: str = ""
 
     # ---------------------------------------------------------------------
@@ -131,6 +135,7 @@ class VWAPMicroMeanReversion(IStrategy):
             self._in_position = False
             self._entry_price = None
             self._entry_qty = None
+            self._entry_time = None
 
     def _update_vwap(self, bar: MarketDataContract) -> Optional[Decimal]:
         # Use typical price * volume when available; else close with unit weight.
@@ -214,6 +219,23 @@ class VWAPMicroMeanReversion(IStrategy):
                 strategy=self.name,
             )
 
+        # P2-INV-09: Max time-in-trade TIMEOUT (uses bar timestamp, never wall clock)
+        if (self._in_position
+                and self._entry_qty
+                and self.max_time_in_trade_minutes > 0
+                and self._entry_time is not None):
+            elapsed = (bar.timestamp - self._entry_time).total_seconds() / 60.0
+            if elapsed >= self.max_time_in_trade_minutes:
+                return StrategySignal(
+                    symbol=bar.symbol,
+                    side="SELL",
+                    quantity=self._entry_qty,
+                    order_type="MARKET",
+                    entry_price=bar.close,
+                    reason="MAX_TIME_IN_TRADE",
+                    strategy=self.name,
+                )
+
         # If in position: exit on mean reversion or stop
         if self._in_position and self._entry_price and self._entry_qty:
             # Stop loss (price-based)
@@ -264,6 +286,7 @@ class VWAPMicroMeanReversion(IStrategy):
 
             self._trades_today += 1
             self._last_entry_reason = f"PRICE_BELOW_VWAP_BY_{self.entry_dev}"
+            self._pending_entry_bar_time = bar.timestamp  # for TIMEOUT tracking
             return StrategySignal(
                 symbol=bar.symbol,
                 side="BUY",
@@ -291,11 +314,13 @@ class VWAPMicroMeanReversion(IStrategy):
             self._in_position = True
             self._entry_price = fill_price
             self._entry_qty = filled_qty
+            self._entry_time = getattr(self, "_pending_entry_bar_time", None)
         else:
             # assume exit fill
             self._in_position = False
             self._entry_price = None
             self._entry_qty = None
+            self._entry_time = None
         return None
 
     def on_order_rejected(self, order_id: str, symbol: str, reason: str):

@@ -61,7 +61,7 @@ def test_1_order_creation_and_retrieval():
     print("  - Get pending orders works")
     
     print("[PASS] Test 1 Complete")
-    return True
+    assert True
 
 
 def test_2_state_transitions():
@@ -129,7 +129,7 @@ def test_2_state_transitions():
     
     event_bus.stop()
     print("[PASS] Test 2 Complete")
-    return True
+    assert True
 
 
 def test_3_partial_fills():
@@ -202,7 +202,7 @@ def test_3_partial_fills():
     
     event_bus.stop()
     print("[PASS] Test 3 Complete")
-    return True
+    assert True
 
 
 def test_4_order_cancellation():
@@ -259,7 +259,7 @@ def test_4_order_cancellation():
     
     event_bus.stop()
     print("[PASS] Test 4 Complete")
-    return True
+    assert True
 
 
 def test_5_order_rejection():
@@ -302,7 +302,7 @@ def test_5_order_rejection():
     
     event_bus.stop()
     print("[PASS] Test 5 Complete")
-    return True
+    assert True
 
 
 def test_6_pending_orders_filtering():
@@ -374,7 +374,7 @@ def test_6_pending_orders_filtering():
     
     event_bus.stop()
     print("[PASS] Test 6 Complete")
-    return True
+    assert True
 
 
 def test_7_order_properties():
@@ -435,7 +435,7 @@ def test_7_order_properties():
     
     event_bus.stop()
     print("[PASS] Test 7 Complete")
-    return True
+    assert True
 
 
 # ============================================================================
