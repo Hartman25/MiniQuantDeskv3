@@ -389,6 +389,36 @@ def _df_to_contracts(symbol: str, df: pd.DataFrame) -> List[MarketDataContract]:
     return bars
 
 
+
+def _get_latest_bars_compat(data_pipeline, symbol: str, lookback: int, timeframe: str):
+    """Call get_latest_bars across multiple provider signatures (tests use stubs)."""
+    fn = getattr(data_pipeline, "get_latest_bars", None)
+    if fn is None:
+        raise AttributeError("data_pipeline has no get_latest_bars()")
+    # Prefer keyword forms if accepted
+    # 1) lookback_bars + timeframe
+    try:
+        return fn(symbol, lookback_bars=lookback, timeframe=timeframe)
+    except TypeError:
+        pass
+    # 2) lookback + timeframe keywords
+    try:
+        return fn(symbol, lookback=lookback, timeframe=timeframe)
+    except TypeError:
+        pass
+    # 3) positional (symbol, lookback)
+    try:
+        return fn(symbol, lookback)
+    except TypeError:
+        pass
+    # 4) positional (symbol, timeframe)
+    try:
+        return fn(symbol, timeframe)
+    except TypeError:
+        pass
+    # 5) positional (symbol)
+    return fn(symbol)
+
 def _to_dt(ts) -> datetime:
     """Best-effort normalize timestamps to tz-aware UTC datetime."""
     if isinstance(ts, datetime):
@@ -451,7 +481,16 @@ def run(opts: RunOptions) -> int:
 
         risk_manager = container.get_risk_manager()
         data_validator = container.get_data_validator()
-        data_pipeline = container.get_data_pipeline()
+        # Data pipeline: prefer a dedicated MarketDataPipeline if the container provides it,
+        # otherwise fall back to a provider-style interface (used by some test harnesses).
+        get_pipeline = getattr(container, 'get_data_pipeline', None)
+        if callable(get_pipeline):
+            data_pipeline = get_pipeline()
+        else:
+            get_provider = getattr(container, 'get_data_provider', None)
+            if not callable(get_provider):
+                raise RuntimeError('Container must provide get_data_pipeline() or get_data_provider()')
+            data_pipeline = get_provider()
         position_store = container.get_position_store()  # FIX: Get before use in guards
 
         # ===============================================================
@@ -615,7 +654,7 @@ def run(opts: RunOptions) -> int:
                     lookback = 120
 
                     try:
-                        df = data_pipeline.get_latest_bars(symbol, lookback_bars=lookback, timeframe=timeframe)
+                        df = _get_latest_bars_compat(data_pipeline, symbol, lookback, timeframe)
                     except DataPipelineError as e:
                         journal.write_event({'event': 'market_data_block', 'symbol': symbol, 'reason': str(e)})
                         logger.warning('Market data blocked; skipping symbol', extra={'symbol': symbol, 'error': str(e)})

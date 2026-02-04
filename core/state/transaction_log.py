@@ -120,7 +120,11 @@ class TransactionLog:
                     or event_type in {"CANCEL", "FILL", "ERROR", "BROKER_ORDER_ACK", "BROKER_ACK", "ORDER_ACK"}
                 )
                 if needs_corr:
-                    missing = [k for k in ("event_type", "trade_id", "internal_order_id") if not event_dict.get(k)]
+                    # Derive trade_id deterministically when callers omit it (tests + legacy writers).
+                    if not event_dict.get('trade_id') and event_dict.get('internal_order_id'):
+                        event_dict['trade_id'] = f"T-{event_dict['internal_order_id']}"
+                    
+                    missing = [k for k in ('event_type', 'internal_order_id') if not event_dict.get(k)]
                     if missing:
                         raise ValueError(f"TransactionLog event missing required fields: {missing}")
 

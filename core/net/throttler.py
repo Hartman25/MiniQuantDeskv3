@@ -9,7 +9,6 @@ Pattern stolen from: Hummingbot async_utils.py
 
 import asyncio
 import time
-import threading
 from collections import deque, defaultdict
 from typing import Dict, Tuple, Callable, Any, Optional
 from dataclasses import dataclass
@@ -59,8 +58,6 @@ class Throttler:
         self._rate_limits = rate_limits
         self._request_times: Dict[str, deque] = defaultdict(deque)
         self._locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-        # Sync locks for execute_sync()
-        self._sync_locks: Dict[str, threading.Lock] = defaultdict(threading.Lock)
         
         # Statistics
         self._total_requests: Dict[str, int] = defaultdict(int)
@@ -115,90 +112,7 @@ class Throttler:
                 )
                 raise
     
-    
-    def execute_sync(
-        self,
-        limit_id: str,
-        func: Callable,
-        *args,
-        **kwargs
-    ) -> Any:
-        """
-        Synchronous wrapper for rate-limited execution.
-
-        WHY THIS EXISTS:
-        - The runtime loop and most connectors in this repo are synchronous.
-        - We still want a SINGLE throttling implementation.
-        - This method uses time.sleep() and a thread lock per limit_id.
-
-        NOTE:
-        - Do NOT call this from inside an active asyncio event loop.
-        """
-        # If called inside a running event loop, force the caller to use execute()
-        try:
-            loop = asyncio.get_running_loop()
-            if loop and loop.is_running():
-                raise RuntimeError(
-                    "execute_sync() called inside an active event loop. "
-                    "Use await throttler.execute(...) instead."
-                )
-        except RuntimeError:
-            # no running loop -> OK
-            pass
-
-        with self._sync_locks[limit_id]:
-            self._wait_if_needed_sync(limit_id)
-
-            now = time.time()
-            self._request_times[limit_id].append(now)
-            self._total_requests[limit_id] += 1
-
-            try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                logger.error(
-                    f"Throttled sync call failed: {limit_id}",
-                    extra={'error': str(e), 'func': getattr(func, '__name__', str(func))}
-                )
-                raise
-
-    def _wait_if_needed_sync(self, limit_id: str) -> float:
-        """Synchronous wait-if-needed. Returns waited seconds."""
-        if limit_id not in self._rate_limits:
-            return 0.0
-
-        limit = self._rate_limits[limit_id]
-        request_times = self._request_times[limit_id]
-
-        now = time.time()
-        cutoff_time = now - limit.time_window
-
-        while request_times and request_times[0] < cutoff_time:
-            request_times.popleft()
-
-        if len(request_times) >= limit.max_requests:
-            oldest_request = request_times[0]
-            wait_time = (oldest_request + limit.time_window) - now
-
-            if wait_time > 0:
-                logger.warning(
-                    f"Rate limit reached for {limit_id}, waiting {wait_time:.2f}s (sync)",
-                    extra={
-                        'limit_id': limit_id,
-                        'wait_time': wait_time,
-                        'limit': str(limit),
-                        'current_requests': len(request_times)
-                    }
-                )
-                self._total_waits[limit_id] += 1
-                self._total_wait_time[limit_id] += wait_time
-                time.sleep(wait_time)
-                return wait_time
-
-        return 0.0
-
-
-async def _wait_if_needed(self, limit_id: str) -> float:
+    async def _wait_if_needed(self, limit_id: str) -> float:
         """
         Wait if at rate limit.
         
@@ -280,6 +194,202 @@ async def _wait_if_needed(self, limit_id: str) -> float:
         self._total_waits.clear()
         self._total_wait_time.clear()
 
+
+class ExponentialBackoff:
+    """
+    Exponential backoff for retry logic.
+    
+    Usage:
+        backoff = ExponentialBackoff(base=1.0, max_delay=60.0)
+        
+        for attempt in range(max_retries):
+            try:
+                result = await some_api_call()
+                break
+            except RateLimitError:
+                delay = backoff.next_delay(attempt)
+                await asyncio.sleep(delay)
+    """
+    
+    def __init__(
+        self,
+        base: float = 1.0,
+        multiplier: float = 2.0,
+        max_delay: float = 60.0,
+        jitter: bool = True
+    ):
+        """
+        Args:
+            base: Base delay in seconds
+            multiplier: Exponential multiplier
+            max_delay: Maximum delay cap
+            jitter: Add random jitter to prevent thundering herd
+        """
+        self.base = base
+        self.multiplier = multiplier
+        self.max_delay = max_delay
+        self.jitter = jitter
+        
+    def next_delay(self, attempt: int) -> float:
+        """
+        Calculate next delay.
+        
+        Args:
+            attempt: Attempt number (0-indexed)
+            
+        Returns:
+            Delay in seconds
+        """
+        import random
+        
+        # Calculate exponential delay
+        delay = min(self.base * (self.multiplier ** attempt), self.max_delay)
+        
+        # Add jitter (±25% of delay)
+        if self.jitter and delay > 0:
+            jitter_range = delay * 0.25
+            delay += random.uniform(-jitter_range, jitter_range)
+        
+        return max(0, delay)
+
+
+# Pre-configured throttlers for common services
+def create_alpaca_throttler() -> Throttler:
+    """
+    Create throttler for Alpaca API.
+    
+    Alpaca limits:
+    - Orders: 200 requests/minute
+    - Data: 200 requests/minute
+    - Account: 200 requests/minute
+    """
+    return Throttler({
+        'alpaca_orders': RateLimit(200, 60.0),
+        'alpaca_data': RateLimit(200, 60.0),
+        'alpaca_account': RateLimit(200, 60.0),
+    })
+
+
+def create_polygon_throttler() -> Throttler:
+    """
+    Create throttler for Polygon API.
+    
+    Polygon limits (basic tier):
+    - 5 requests/second
+    """
+    return Throttler({
+        'polygon_bars': RateLimit(5, 1.0),
+        'polygon_quotes': RateLimit(5, 1.0),
+        'polygon_trades': RateLimit(5, 1.0),
+    })
+
+
+def create_combined_throttler() -> Throttler:
+    """
+    Create throttler combining all services.
+    """
+    return Throttler({
+        # Alpaca
+        'alpaca_orders': RateLimit(200, 60.0),
+        'alpaca_data': RateLimit(200, 60.0),
+        'alpaca_account': RateLimit(200, 60.0),
+        
+        # Polygon
+        'polygon_bars': RateLimit(5, 1.0),
+        'polygon_quotes': RateLimit(5, 1.0),
+        'polygon_trades': RateLimit(5, 1.0),
+        
+        # Finnhub
+        'finnhub_quote': RateLimit(60, 60.0),  # 60/min free tier
+        
+        # Alpha Vantage
+        'alpha_vantage': RateLimit(5, 60.0),  # 5/min free tier
+        
+        # Financial Modeling Prep
+        'fmp': RateLimit(250, 86400.0),  # 250/day free tier
+    })
+
+    async def _wait_if_needed(self, limit_id: str) -> float:
+        """
+        Wait if at rate limit.
+
+        Returns:
+            Time waited in seconds (0 if no wait)
+        """
+        if limit_id not in self._rate_limits:
+            # No limit defined, allow immediately
+            return 0.0
+
+        limit = self._rate_limits[limit_id]
+        request_times = self._request_times[limit_id]
+
+        # Remove old requests outside time window
+        now = time.time()
+        cutoff_time = now - limit.time_window
+
+        while request_times and request_times[0] < cutoff_time:
+            request_times.popleft()
+
+        # Check if at limit
+        if len(request_times) >= limit.max_requests:
+            # Calculate wait time
+            oldest_request = request_times[0]
+            wait_time = (oldest_request + limit.time_window) - now
+
+            if wait_time > 0:
+                logger.warning(
+                    f"Rate limit reached for {limit_id}, waiting {wait_time:.2f}s",
+                    extra={
+                        'limit_id': limit_id,
+                        'wait_time': wait_time,
+                        'limit': str(limit),
+                        'current_requests': len(request_times)
+                    }
+                )
+
+                self._total_waits[limit_id] += 1
+                self._total_wait_time[limit_id] += wait_time
+
+                await asyncio.sleep(wait_time)
+                return wait_time
+
+        return 0.0
+
+    def get_stats(self, limit_id: Optional[str] = None) -> Dict:
+        """
+        Get throttling statistics.
+
+        Args:
+            limit_id: Specific limit to get stats for, or None for all
+
+        Returns:
+            Statistics dict
+        """
+        if limit_id:
+            return {
+                'limit_id': limit_id,
+                'limit': str(self._rate_limits.get(limit_id, 'No limit')),
+                'total_requests': self._total_requests[limit_id],
+                'total_waits': self._total_waits[limit_id],
+                'total_wait_time': self._total_wait_time[limit_id],
+                'avg_wait_time': (
+                    self._total_wait_time[limit_id] / self._total_waits[limit_id]
+                    if self._total_waits[limit_id] > 0
+                    else 0.0
+                ),
+                'current_window_requests': len(self._request_times[limit_id])
+            }
+        else:
+            return {
+                lid: self.get_stats(lid)
+                for lid in self._rate_limits.keys()
+            }
+
+    def reset_stats(self) -> None:
+        """Reset all statistics"""
+        self._total_requests.clear()
+        self._total_waits.clear()
+        self._total_wait_time.clear()
 
 class ExponentialBackoff:
     """
