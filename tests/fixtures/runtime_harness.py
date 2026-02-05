@@ -42,6 +42,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from enum import Enum
 import pandas as pd
+import uuid
 
 # Real system imports
 from core.di.container import Container
@@ -468,8 +469,8 @@ class AcceptanceHarness:
                 continue
             
             # Submit order
-            internal_id = f"TEST_{symbol}_{datetime.now(timezone.utc).timestamp()}"
-            
+            internal_id = f"TEST_{symbol}_{uuid.uuid4().hex}"
+
             stop_loss = signal.get("stop_loss")
             take_profit = signal.get("take_profit")
             if stop_loss:

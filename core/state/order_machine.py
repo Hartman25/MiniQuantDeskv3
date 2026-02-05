@@ -301,8 +301,16 @@ class OrderStateMachine:
         """Create new order with PENDING state."""
         with self._lock:
             if order_id in self._orders:
-                raise OrderStateMachineError(f"Order {order_id} already exists")
-            
+                # Idempotency: duplicate create for same order_id should not crash the system.
+                # Return the existing order.
+                existing = self._orders[order_id]
+                try:
+                    logger.warning("Idempotent create_order: order_id already exists; returning existing order",
+                                extra={"order_id": order_id, "symbol": symbol})
+                except Exception:
+                    pass
+                return existing
+
             order = Order(
                 order_id=order_id,
                 symbol=symbol,
