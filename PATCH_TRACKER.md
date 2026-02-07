@@ -146,7 +146,35 @@
   - ✅ Bad strategy raises StrategyPurityError immediately
 
 ## PATCH 6: Persist and restore pending orders into the order state machine
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `restore_pending_orders()` method to `OrderStateMachine` that
+  replays the transaction log, tracks the latest state per order_id, and restores
+  any non-terminal orders (SUBMITTED, PARTIALLY_FILLED) back into memory.
+  Also added ORDER_CREATED event logging in `create_order()` so metadata
+  (symbol, strategy, quantity, side, order_type) survives crash/restart.
+- **Files changed:**
+  - `core/state/order_machine.py` — added `restore_pending_orders()` method;
+    `create_order()` now logs ORDER_CREATED event to transaction log
+  - `tests/p1/test_patch6_pending_order_persistence.py` (NEW — 8 tests)
+- **Tests added:**
+  - `test_submitted_order_restored` — SUBMITTED survives simulated crash
+  - `test_filled_order_not_restored` — FILLED is terminal, not restored
+  - `test_cancelled_order_not_restored` — CANCELLED is terminal, not restored
+  - `test_multiple_orders_mixed` — only non-terminal orders restored
+  - `test_idempotent` — calling restore twice doesn't duplicate
+  - `test_partially_filled_restored` — PARTIALLY_FILLED is non-terminal
+  - `test_empty_log_restores_nothing` — empty log → 0 restored
+  - `test_metadata_survives_roundtrip` — symbol, strategy, broker_order_id survive
+- **Commands run + results:**
+  - `python -m py_compile core/state/order_machine.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch6_pending_order_persistence.py -v` → 8 passed
+- **Done definition:**
+  - ✅ On restart, SUBMITTED/PARTIALLY_FILLED orders restored from transaction log
+  - ✅ Terminal orders (FILLED, CANCELLED, REJECTED, EXPIRED) NOT restored
+  - ✅ Idempotent: calling restore twice doesn't duplicate
+  - ✅ Metadata (symbol, strategy, broker_order_id) survives round-trip
 
 ## PATCH 7: Periodic reconciliation, not just startup
 - **Status:** TODO
