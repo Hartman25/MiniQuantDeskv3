@@ -4,7 +4,8 @@ Tests the critical OrderStateMachine integration without complex setup.
 """
 
 import sys
-sys.path.insert(0, r'C:\Users\Zacha\Desktop\MiniQuantDeskv2')
+from pathlib import Path as _Path
+sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
 
 from decimal import Decimal
 from datetime import datetime, timezone

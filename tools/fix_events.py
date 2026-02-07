@@ -3,9 +3,11 @@ Quick fix script to add timestamp fields to all event dataclasses.
 """
 
 import re
+from pathlib import Path
 
 # Read the file
-with open(r'C:\Users\Zacha\Desktop\MiniQuantDeskv2\core\events\types.py', 'r', encoding='utf-8') as f:
+_repo = Path(__file__).resolve().parent.parent
+with open(_repo / 'core' / 'events' / 'types.py', 'r', encoding='utf-8') as f:
     content = f.read()
 
 # Find all dataclass event definitions and add timestamp if missing
@@ -39,7 +41,7 @@ def add_timestamp_if_missing(match):
 content_fixed = re.sub(pattern, add_timestamp_if_missing, content, flags=re.DOTALL)
 
 # Write back
-with open(r'C:\Users\Zacha\Desktop\MiniQuantDeskv2\core\events\types.py', 'w', encoding='utf-8') as f:
+with open(_repo / 'core' / 'events' / 'types.py', 'w', encoding='utf-8') as f:
     f.write(content_fixed)
 
 print("Fixed all event classes with timestamp fields")

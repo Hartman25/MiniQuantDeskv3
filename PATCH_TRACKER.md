@@ -285,7 +285,41 @@
   - ✅ Idempotent place/cancel (no-op on duplicate)
 
 ## PATCH 10: Remove repo landmines
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Removed backup files (.bak/.backup), deprecated protections_old/
+  directory (14 files), and replaced all hardcoded absolute user paths with
+  relative paths.  Added 8 guardrail tests that prevent these landmines from
+  returning.
+- **Files changed:**
+  - DELETED: `legacy/brokers/alpaca_connector_ORIGINAL.py.backup`
+  - DELETED: `legacy/core/app_ORIGINAL.py.backup`
+  - DELETED: `legacy/core/reconciler_ORIGINAL.py.backup`
+  - DELETED: `legacy/tests/conftest.py.bak`
+  - DELETED: `legacy/tests/test_01_entry_places_protective_stop.py.bak`
+  - DELETED: `core/risk/protections_old/` (14 files)
+  - `tools/VERIFY_PROTECTION_MIGRATION.py` — fixed hardcoded path + import
+  - `tools/check_inventory.py` — fixed hardcoded path
+  - `tools/fix_events.py` — fixed hardcoded paths
+  - `tests/test_integration_simple.py` — fixed hardcoded sys.path
+  - `tests/p1/test_patch10_repo_landmines.py` (NEW — 8 guardrail tests)
+- **Tests added:**
+  - `test_no_backup_files_tracked` — no .bak/.backup/.orig in git
+  - `test_no_deprecated_protections_old` — directory removed
+  - `test_no_hardcoded_user_paths` — no C:/Users/... in .py files
+  - `test_no_hardcoded_api_keys` — no real keys in .py files
+  - `test_no_pdb_in_production_code` — no debug breakpoints
+  - `test_gitignore_covers_essentials` — .gitignore has required patterns
+  - `test_config_uses_placeholders` — config.yaml uses placeholders only
+  - `test_no_import_from_protections_old` — no imports from dead code
+- **Commands run + results:**
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch10_repo_landmines.py -v` → 8 passed
+- **Done definition:**
+  - ✅ All backup files removed from git
+  - ✅ Deprecated protections_old/ directory deleted
+  - ✅ All hardcoded user paths replaced with relative paths
+  - ✅ Guardrail tests prevent regression
 
 ## PATCH 11: Guarantee single-trade-at-a-time enforced in engine
 - **Status:** TODO
