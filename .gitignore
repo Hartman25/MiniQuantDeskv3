@@ -85,11 +85,19 @@ data/
 *.sqlite
 *.sqlite3
 
-# Secrets / credentials
-config.toml
-config/*.toml
-config/*.yaml
-config/*.yml
+# Secrets / credentials (ignore only secrets)
+config/.env.local
+config/.env.*
+.env
+.env.*
+
+# If you keep secret YAML variants, ignore those only
+config/*secrets*.yml
+config/*secrets*.yaml
+config/*secret*.yml
+config/*secret*.yaml
+config/*local*.yml
+config/*local*.yaml
 
 # Local logs
 logs/
