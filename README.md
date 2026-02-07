@@ -1,7 +1,7 @@
 <p align="center">
-  <img src="assets/logo/miniquantdesk_logo_shield_terminal.png"
+  <img src="assets/logo/miniquantdesk_banner_wide.png"
        alt="MiniQuantDesk"
-       width="600">
+       width="480">
 </p>
 
 <h1 align="center">MiniQuantDesk</h1>
