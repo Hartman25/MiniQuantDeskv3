@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import argparse
-import sys
 import os
+import sys
 from pathlib import Path
 
 from core.runtime.app import RunOptions, run
 
+
+# ----------------------------
+# CLI / Smoke helpers
+# ----------------------------
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -38,17 +42,6 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         help="Print whether API env vars were loaded (no secrets) and exit.",
     )
     return p.parse_args(argv)
-
-
-def run_paper(*, config_path: Path, run_interval_s: int = 60, run_once: bool = False) -> int:
-    return run(
-        RunOptions(
-            config_path=config_path,
-            mode="paper",
-            run_interval_s=run_interval_s,
-            run_once=run_once,
-        )
-    )
 
 
 def _load_env_local(cfg_path: Path) -> Path | None:
@@ -84,6 +77,21 @@ def _apply_env_aliases() -> None:
         os.environ["ALPACA_API_SECRET"] = os.getenv("BROKER_API_SECRET", "")
 
 
+# ----------------------------
+# Runner
+# ----------------------------
+
+def run_paper(*, config_path: Path, run_interval_s: int = 60, run_once: bool = False) -> int:
+    return run(
+        RunOptions(
+            config_path=config_path,
+            mode="paper",
+            run_interval_s=run_interval_s,
+            run_once=run_once,
+        )
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -114,11 +122,19 @@ def main(argv: list[str] | None = None) -> int:
 
     interval = 0 if args.once else max(1, int(args.interval))
 
-    return run_paper(
-        config_path=cfg_path,
-        run_interval_s=interval,
-        run_once=bool(args.once),
-    )
+    try:
+        return run_paper(
+            config_path=cfg_path,
+            run_interval_s=interval,
+            run_once=bool(args.once),
+        )
+    except KeyboardInterrupt:
+        # Smoke rule: Ctrl-C always exits cleanly.
+        return 0
+    except Exception as e:
+        # Smoke rule: never crash with a traceback from the entrypoint.
+        print(f"[entry_paper] ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

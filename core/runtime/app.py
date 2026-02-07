@@ -1278,6 +1278,10 @@ def run(opts: RunOptions) -> int:
                         state.running = False
                         break
 
+            except KeyboardInterrupt:
+                # Smoke-track hardening: Ctrl-C should always exit cleanly (no traceback)
+                return 0
+
             except Exception as e:
                 try:
                     journal.write_event({"event": "runtime_error", "error": str(e)})

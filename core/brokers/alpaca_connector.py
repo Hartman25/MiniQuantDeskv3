@@ -17,6 +17,7 @@ Based on Alpaca Trading API v2.
 from typing import Optional, List, Dict, Tuple
 from decimal import Decimal
 from datetime import datetime
+import os
 import time
 import logging
 from enum import Enum
@@ -83,6 +84,16 @@ class AlpacaBrokerConnector:
         })
         
         self._verify_account()
+
+    def _ensure_orders_allowed(self) -> None:
+        """Refuse order placement when running in explicit smoke mode.
+
+        This is a HARD safety guard used by entry_live.py --once.
+        """
+        if os.getenv("MQD_SMOKE_NO_ORDERS", "").strip().lower() in ("1", "true", "yes"):
+            raise BrokerOrderError(
+                "SMOKE MODE: order placement is disabled (MQD_SMOKE_NO_ORDERS=1)."
+            )
     
     def _verify_account(self):
         """Verify account access."""
@@ -105,6 +116,7 @@ class AlpacaBrokerConnector:
         """Submit market order. Returns broker_order_id."""
         with LogContext(internal_order_id):
             try:
+                self._ensure_orders_allowed()
                 request = MarketOrderRequest(
                     symbol=symbol,
                     qty=float(quantity),
@@ -285,6 +297,7 @@ class AlpacaBrokerConnector:
         """Submit limit order. Returns broker_order_id."""
         with LogContext(internal_order_id):
             try:
+                self._ensure_orders_allowed()
                 if limit_price is None or limit_price <= 0:
                     raise ValueError(f"limit_price must be positive, got {limit_price}")
 
@@ -330,6 +343,7 @@ class AlpacaBrokerConnector:
         """Submit stop (market) order. Returns broker_order_id."""
         with LogContext(internal_order_id):
             try:
+                self._ensure_orders_allowed()
                 if stop_price is None or stop_price <= 0:
                     raise ValueError(f"stop_price must be positive, got {stop_price}")
 
@@ -367,6 +381,7 @@ class AlpacaBrokerConnector:
 # ============================================================================
 # EXCEPTIONS
 # ============================================================================
+
 
 class BrokerConnectionError(Exception):
     """Broker connection error."""

@@ -91,6 +91,9 @@ config/.env.*
 .env
 .env.*
 
+# Accidental stray file created by pasted text / encoding weirdness
+tore CLI flags and smoke-run behavior*
+
 # If you keep secret YAML variants, ignore those only
 config/*secrets*.yml
 config/*secrets*.yaml
