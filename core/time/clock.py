@@ -155,6 +155,178 @@ class ClockFactory:
 SystemClock = RealTimeClock
 
 
+# ============================================================================
+# PATCH 12: Time normalization helpers + MarketSession
+# ============================================================================
+
+from dataclasses import dataclass
+from typing import Tuple
+import time as _time_mod
+
+
+def utc_now() -> datetime:
+    """
+    Canonical way to get the current UTC time as a timezone-aware datetime.
+
+    Use this instead of ``datetime.now()`` or ``datetime.now(timezone.utc)``
+    everywhere so that grep can verify no raw ``datetime.now()`` calls remain.
+    """
+    return datetime.now(timezone.utc)
+
+
+def ensure_utc(dt: datetime) -> datetime:
+    """
+    Ensure *dt* is timezone-aware and in UTC.
+
+    - If naive (no tzinfo): attach UTC (assumes caller meant UTC).
+    - If aware but not UTC: convert to UTC.
+    - If already UTC-aware: return as-is.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def epoch_ms(dt: Optional[datetime] = None) -> int:
+    """
+    Return milliseconds since Unix epoch for *dt* (or now if None).
+
+    Always produces a deterministic result regardless of host timezone.
+    """
+    if dt is None:
+        return int(_time_mod.time() * 1000)
+    return int(ensure_utc(dt).timestamp() * 1000)
+
+
+@dataclass(frozen=True)
+class SessionBoundary:
+    """
+    One named time window within a trading day.
+
+    All times are in **market timezone** (America/New_York for US equities).
+    """
+    name: str            # "pre_market", "regular", "after_hours"
+    open_hour: int
+    open_minute: int
+    close_hour: int
+    close_minute: int
+
+    def contains(self, hour: int, minute: int) -> bool:
+        """Return True if (hour, minute) falls within [open, close)."""
+        open_val = self.open_hour * 60 + self.open_minute
+        close_val = self.close_hour * 60 + self.close_minute
+        current = hour * 60 + minute
+        return open_val <= current < close_val
+
+
+class MarketSession:
+    """
+    Defines session boundaries for a market.
+
+    Provides structured queries:
+      - is_regular_hours(dt)
+      - is_pre_market(dt)
+      - is_after_hours(dt)
+      - is_any_session(dt)
+      - current_session(dt) → name or None
+      - next_open(dt) → datetime of next regular open
+
+    All methods accept UTC-aware datetimes and internally convert to
+    market timezone.  Weekends always return False.
+    """
+
+    # US Equity defaults
+    PRE_MARKET = SessionBoundary("pre_market", 4, 0, 9, 30)
+    REGULAR = SessionBoundary("regular", 9, 30, 16, 0)
+    AFTER_HOURS = SessionBoundary("after_hours", 16, 0, 20, 0)
+
+    def __init__(
+        self,
+        market_tz: str = "America/New_York",
+        pre_market: Optional[SessionBoundary] = None,
+        regular: Optional[SessionBoundary] = None,
+        after_hours: Optional[SessionBoundary] = None,
+    ) -> None:
+        self._market_tz_name = market_tz
+        try:
+            from zoneinfo import ZoneInfo
+            self._market_tz = ZoneInfo(market_tz)
+        except Exception:
+            self._market_tz = pytz.timezone(market_tz)
+
+        self._pre_market = pre_market or self.PRE_MARKET
+        self._regular = regular or self.REGULAR
+        self._after_hours = after_hours or self.AFTER_HOURS
+        self._sessions = [self._pre_market, self._regular, self._after_hours]
+
+    def _to_market(self, dt: datetime) -> datetime:
+        return ensure_utc(dt).astimezone(self._market_tz)
+
+    def _is_weekday(self, dt: datetime) -> bool:
+        return self._to_market(dt).weekday() < 5
+
+    def is_regular_hours(self, dt: Optional[datetime] = None) -> bool:
+        dt = dt or utc_now()
+        if not self._is_weekday(dt):
+            return False
+        mt = self._to_market(dt)
+        return self._regular.contains(mt.hour, mt.minute)
+
+    def is_pre_market(self, dt: Optional[datetime] = None) -> bool:
+        dt = dt or utc_now()
+        if not self._is_weekday(dt):
+            return False
+        mt = self._to_market(dt)
+        return self._pre_market.contains(mt.hour, mt.minute)
+
+    def is_after_hours(self, dt: Optional[datetime] = None) -> bool:
+        dt = dt or utc_now()
+        if not self._is_weekday(dt):
+            return False
+        mt = self._to_market(dt)
+        return self._after_hours.contains(mt.hour, mt.minute)
+
+    def is_any_session(self, dt: Optional[datetime] = None) -> bool:
+        dt = dt or utc_now()
+        if not self._is_weekday(dt):
+            return False
+        mt = self._to_market(dt)
+        return any(s.contains(mt.hour, mt.minute) for s in self._sessions)
+
+    def current_session(self, dt: Optional[datetime] = None) -> Optional[str]:
+        """Return the name of the current session, or None if outside all."""
+        dt = dt or utc_now()
+        if not self._is_weekday(dt):
+            return None
+        mt = self._to_market(dt)
+        for s in self._sessions:
+            if s.contains(mt.hour, mt.minute):
+                return s.name
+        return None
+
+    def regular_open_close(self, dt: Optional[datetime] = None) -> Tuple[datetime, datetime]:
+        """
+        Return (open, close) as UTC datetimes for the regular session
+        on the same calendar day as *dt* (in market tz).
+        """
+        dt = dt or utc_now()
+        mt = self._to_market(dt)
+        day = mt.date()
+
+        # Build market-tz aware datetimes then convert to UTC
+        open_mt = mt.replace(
+            hour=self._regular.open_hour,
+            minute=self._regular.open_minute,
+            second=0, microsecond=0,
+        )
+        close_mt = mt.replace(
+            hour=self._regular.close_hour,
+            minute=self._regular.close_minute,
+            second=0, microsecond=0,
+        )
+        return ensure_utc(open_mt), ensure_utc(close_mt)
+
+
 # Convenience function for getting clock from config
 def get_clock(config: dict) -> Clock:
     """

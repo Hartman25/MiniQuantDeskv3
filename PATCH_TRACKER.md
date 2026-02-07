@@ -358,7 +358,26 @@
   - ✅ Journal-ready events for every decision
 
 ## PATCH 12: Normalize time and session boundaries
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `utc_now()`, `ensure_utc()`, `epoch_ms()` helpers and
+  `MarketSession`/`SessionBoundary` classes to `core/time/clock.py`.
+  Provides canonical UTC time access, naive→aware normalization, and
+  structured session boundary queries (pre-market, regular, after-hours).
+- **Files changed:**
+  - `core/time/clock.py` — added time helpers + MarketSession
+  - `tests/p1/test_patch12_time_normalization.py` (NEW — 19 tests)
+- **Tests added:** 19 tests covering utc_now, ensure_utc, epoch_ms,
+  SessionBoundary.contains, MarketSession (regular/pre/after/weekend/outside)
+- **Commands run + results:**
+  - `python -m py_compile core/time/clock.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch12_time_normalization.py -v` → 19 passed
+- **Done definition:**
+  - ✅ Canonical `utc_now()` helper
+  - ✅ `ensure_utc()` normalizes naive datetimes
+  - ✅ MarketSession defines pre-market/regular/after-hours boundaries
+  - ✅ All session queries accept UTC and convert internally
 
 ## PATCH 13: Make backtest and live share same execution interface
 - **Status:** TODO
