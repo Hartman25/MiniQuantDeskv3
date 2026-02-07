@@ -417,7 +417,44 @@
   - ✅ Market orders auto-fill, limits start SUBMITTED
 
 ## PATCH 14: Add deterministic research runner
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `ResearchRunner` class to `core/research/runner.py` that
+  provides a sealed, reproducible environment for strategy research.  Uses
+  `BacktestClock` for deterministic time, seeded RNG for reproducible randomness,
+  and configurable fill-price source.  Every decision is logged in a journal-
+  ready event list.  `finalize()` seals the run and produces a `ResearchReport`.
+  `reset()` creates a fresh runner with the same config for re-run comparison.
+- **Files changed:**
+  - `core/research/__init__.py` (NEW)
+  - `core/research/runner.py` (NEW)
+  - `tests/p1/test_patch14_research_runner.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_empty_run_zero_bars` — empty run produces zero-bar report
+  - `test_no_strategy_no_signal` — NO_SIGNAL without strategy
+  - `test_strategy_submit_market` — SUBMIT_MARKET with strategy
+  - `test_fill_uses_close_price` — default fill from close
+  - `test_fill_uses_open_price` — configurable fill from open
+  - `test_deterministic_same_seed` — same seed → identical results
+  - `test_different_seed_different_ids` — different seeds → different IDs
+  - `test_finalize_prevents_add_bar` — sealed after finalize
+  - `test_double_finalize_raises` — double finalize raises
+  - `test_journal_has_start_and_end` — journal bookends
+  - `test_report_to_dict_serializable` — JSON-serializable report
+  - `test_config_hash_deterministic` — same params → same hash
+  - `test_reset_creates_fresh_runner` — reset for re-run
+  - `test_clock_advances_per_bar` — clock advances correctly
+  - `test_skip_when_qty_zero` — zero qty → SKIP
+  - `test_rng_seeded_and_reproducible` — seeded RNG
+- **Commands run + results:**
+  - `python -m py_compile core/research/runner.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch14_research_runner.py -v` → 16 passed
+- **Done definition:**
+  - ✅ Same seed + bars + strategy → identical results
+  - ✅ No I/O, no real broker
+  - ✅ Every decision journal-logged
+  - ✅ Reproducible RNG via explicit seed
 
 ## PATCH 15: Enforce config discipline with schema validation
 - **Status:** TODO
