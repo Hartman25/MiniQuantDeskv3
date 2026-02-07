@@ -322,7 +322,40 @@
   - ✅ Guardrail tests prevent regression
 
 ## PATCH 11: Guarantee single-trade-at-a-time enforced in engine
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `SingleTradeGuard` class with atomic check-and-reserve
+  mechanism.  At most one entry order per symbol can be in-flight.  Closes
+  the race window between coordinator's pure check and broker submission.
+  Thread-safe, every decision journal-logged.
+- **Files changed:**
+  - `core/execution/single_trade_guard.py` (NEW)
+  - `tests/p1/test_patch11_single_trade_guard.py` (NEW — 15 tests)
+- **Tests added:**
+  - `test_reserve_succeeds_on_empty` — first reserve works
+  - `test_reserve_blocked_when_taken` — duplicate blocked
+  - `test_release_frees_symbol` — release allows re-reserve
+  - `test_release_idempotent` — release on empty is noop
+  - `test_different_symbols_concurrent` — independent symbols OK
+  - `test_is_reserved_and_get_reservation` — query methods
+  - `test_reserved_symbols_snapshot` — full snapshot
+  - `test_count_property` — active count
+  - `test_event_to_dict` — event shape
+  - `test_history_records_all` — audit trail
+  - `test_thread_safety_only_one_wins` — 10 threads, 1 wins
+  - `test_restore_reservations` — startup restore
+  - `test_restore_skips_existing` — no overwrite
+  - `test_clear_all` — bulk clear
+  - `test_blocked_event_carries_blocking_id` — blocked reason
+- **Commands run + results:**
+  - `python -m py_compile core/execution/single_trade_guard.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch11_single_trade_guard.py -v` → 15 passed
+- **Done definition:**
+  - ✅ Atomic check-and-reserve at engine level
+  - ✅ Only one entry per symbol in-flight
+  - ✅ Thread-safe (10-thread contention test)
+  - ✅ Journal-ready events for every decision
 
 ## PATCH 12: Normalize time and session boundaries
 - **Status:** TODO
