@@ -1232,6 +1232,25 @@ def run(opts: RunOptions) -> int:
                                     )
                                     position_store.upsert(pos)
                                 else:
+                                    # -- Realized PnL wiring --
+                                    # Get entry price BEFORE deleting the position
+                                    existing_pos = position_store.get(sig_symbol)
+                                    if existing_pos is not None and hasattr(existing_pos, "entry_price") and existing_pos.entry_price is not None:
+                                        try:
+                                            realized_pnl = (fill_price - existing_pos.entry_price) * filled_qty
+                                            limits_tracker = container.get_limits_tracker()
+                                            limits_tracker.record_realized_pnl(realized_pnl)
+                                            logger.info(
+                                                "Recorded realized PnL: %.4f (fill=%.4f, entry=%.4f, qty=%.4f)",
+                                                realized_pnl, fill_price, existing_pos.entry_price, filled_qty,
+                                            )
+                                        except Exception:
+                                            logger.warning("Failed to record realized PnL", exc_info=True)
+                                    else:
+                                        logger.warning(
+                                            "Cannot compute realized PnL for %s: no entry_price on existing position",
+                                            sig_symbol,
+                                        )
                                     position_store.delete(sig_symbol)
                             except Exception:
                                 logger.warning("PositionStore update failed", exc_info=True)

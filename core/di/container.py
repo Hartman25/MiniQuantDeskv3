@@ -284,6 +284,11 @@ class Container:
             raise RuntimeError("Container not initialized")
         return self._data_pipeline
     
+    def get_limits_tracker(self) -> PersistentLimitsTracker:
+        if self._limits_tracker is None:
+            raise RuntimeError("Container not initialized")
+        return self._limits_tracker
+
     def get_risk_gate(self) -> PreTradeRiskGate:
         if self._risk_gate is None:
             raise RuntimeError("Container not initialized")

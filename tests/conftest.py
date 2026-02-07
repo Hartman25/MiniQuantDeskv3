@@ -8,6 +8,9 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import pandas as pd
 import pytest
+import threading
+import atexit
+import time
 
 # tests/conftest.py
 
@@ -183,34 +186,54 @@ class FakePositionStore:
         self._positions = {}
         if position_qty is not None:
             self._positions["SPY"] = SimpleNamespace(qty=position_qty, symbol="SPY")
-    
+
+    def get(self, symbol: str):
+        """Match real PositionStore.get(symbol) -> Optional[Position]"""
+        return self._positions.get(symbol)
+
     def get_position(self, symbol: str):
         return self._positions.get(symbol)
-    
+
     def has_open_position(self, symbol: str) -> bool:
         pos = self.get_position(symbol)
         if pos is None:
             return False
         qty = getattr(pos, "qty", 0)
         return qty != 0
-    
+
     def get_all_positions(self):
         return list(self._positions.values())
-    
+
     def upsert(self, position):
         symbol = getattr(position, "symbol", None)
         if symbol:
             self._positions[symbol] = position
-    
+
     def delete(self, symbol: str):
         self._positions.pop(symbol, None)
+
+
+class FakeLimitsTracker:
+    """Fake PersistentLimitsTracker for testing realized PnL recording"""
+    def __init__(self, daily_loss_limit=Decimal("1000")):
+        self._daily_pnl = Decimal("0")
+        self._daily_loss_limit = daily_loss_limit
+
+    def record_realized_pnl(self, pnl):
+        self._daily_pnl += Decimal(str(pnl))
+
+    def get_daily_realized_pnl(self):
+        return self._daily_pnl
+
+    def is_daily_loss_limit_breached(self):
+        return self._daily_pnl <= -self._daily_loss_limit
 
 
 class FakeReconciler:
     """Fake reconciler"""
     def reconcile_startup(self):
         return []
-    
+
     def heal_startup(self, discrepancies):
         return True
 
@@ -373,6 +396,7 @@ class FakeContainer:
         self._data_validator = FakeDataValidator()
         self._position_store = FakePositionStore(position_qty)
         self._reconciler = FakeReconciler()
+        self._limits_tracker = FakeLimitsTracker()
 
     def initialize(self, _config_path):
         return None
@@ -438,6 +462,10 @@ class FakeContainer:
     def get_order_execution_engine(self):
         """Return execution engine (alternative method name)"""
         return self._exec_engine
+
+    def get_limits_tracker(self):
+        """Return limits tracker (compatibility with app.py realized PnL wiring)"""
+        return self._limits_tracker
 
 
 def _fake_df_to_contracts(symbol: str, df: pd.DataFrame):
@@ -549,3 +577,16 @@ def results():
     """Fixture for test_integration_comprehensive.py TestResults tracking."""
     from tests.test_integration_comprehensive import TestResults
     return TestResults()
+
+def _dump_threads(tag: str):
+    print(f"\n[THREAD_DUMP:{tag}] active_threads={threading.active_count()}")
+    for t in threading.enumerate():
+        print(f"  - name={t.name!r} daemon={t.daemon} alive={t.is_alive()} ident={t.ident}")
+
+def pytest_sessionfinish(session, exitstatus):
+    _dump_threads("pytest_sessionfinish")
+    # give a moment for shutdown hooks to run
+    time.sleep(0.2)
+    _dump_threads("pytest_sessionfinish+200ms")
+
+atexit.register(lambda: _dump_threads("atexit"))
