@@ -93,7 +93,32 @@
   - ✅ Stats correctly track sync calls
 
 ## PATCH 4: Split runtime loop into coordinator + pure steps
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Extracted the per-signal decision logic from the monolithic
+  `run()` function into a new `core/runtime/coordinator.py` module.  All guard
+  checks (single-trade, cooldown, protection, risk, position) are now pure
+  functions that receive immutable snapshots and return `SignalDecision` objects.
+  No I/O in the coordinator — all side-effects remain in the outer `run()` loop.
+- **Files changed:**
+  - `core/runtime/coordinator.py` (NEW — pure decision logic)
+  - `tests/p1/test_patch4_coordinator_pure_steps.py` (NEW — 30 tests)
+- **Key types introduced:**
+  - `Action` enum: SUBMIT_MARKET, SUBMIT_LIMIT, SKIP, NO_SIGNAL
+  - `SkipReason` enum: 12 distinct skip reasons
+  - `SignalSnapshot`, `MarketSnapshot` (frozen dataclasses)
+  - `GuardResult`, `SignalDecision`, `CycleResult`
+  - Pure functions: `evaluate_signal()`, `check_cooldown()`,
+    `check_single_trade()`, `check_position_for_sell()`, `cap_sell_qty()`,
+    `apply_risk_qty()`
+- **Tests added:** 30 tests covering every guard path
+- **Commands run + results:**
+  - `python -m py_compile core/runtime/coordinator.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch4_coordinator_pure_steps.py -v` → 30 passed
+- **Done definition:**
+  - ✅ run() can call Coordinator's evaluate_signal(); step returns pure Decision
+  - ✅ 100% of existing tests still pass (120/120)
 
 ## PATCH 5: Make strategy decision purity enforceable
 - **Status:** TODO
