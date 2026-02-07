@@ -211,7 +211,39 @@
   - ✅ Errors don't crash, produce synthetic discrepancy records
 
 ## PATCH 8: Fail-closed on data staleness with explicit journal record
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `StalenessGuard` class and `StalenessVerdict` dataclass to
+  `core/data/validator.py`.  Every bar freshness check produces a journal-ready
+  event dict (auditable trail).  Rejection reasons: `stale` (age > threshold),
+  `incomplete` (bar not closed, anti-lookahead), `no_data` (None bar),
+  `completion_check_error` (fail-closed on exception).
+- **Files changed:**
+  - `core/data/validator.py` — added `StalenessGuard`, `StalenessVerdict`
+  - `tests/p1/test_patch8_staleness_guard.py` (NEW — 14 tests)
+- **Tests added:**
+  - `test_fresh_complete_bar_passes` — fresh + complete passes
+  - `test_stale_bar_rejected` — age > threshold rejected
+  - `test_incomplete_bar_rejected` — not closed rejected
+  - `test_no_bar_rejected` — None bar rejected
+  - `test_custom_threshold_respected` — configurable threshold
+  - `test_event_has_required_keys` — journal event shape
+  - `test_passed_event_has_bar_age` — bar_age_s in passed event
+  - `test_rejected_stale_has_bar_timestamp` — bar_timestamp in stale event
+  - `test_require_complete_false_skips_check` — opt-out completion check
+  - `test_symbol_fallback_when_bar_none` — symbol from param
+  - `test_verdict_is_frozen` — immutable verdict
+  - `test_completion_error_fails_closed` — exception causes rejection
+  - `test_no_data_event_has_none_age` — None age for no_data
+  - `test_threshold_boundary_passes` — exact threshold passes
+- **Commands run + results:**
+  - `python -m py_compile core/data/validator.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch8_staleness_guard.py -v` → 14 passed
+- **Done definition:**
+  - ✅ Every staleness decision produces journal-ready event
+  - ✅ Fail-closed: stale, incomplete, missing bars all rejected
+  - ✅ Auditable trail for both pass and reject outcomes
 
 ## PATCH 9: Make protective-stop lifecycle authoritative
 - **Status:** TODO
