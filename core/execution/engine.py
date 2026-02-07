@@ -129,6 +129,12 @@ class OrderExecutionEngine:
         if run_id:
             self._run_id = run_id
 
+    def register_trade_id(self, internal_order_id: str, trade_id: str) -> None:
+        """Pre-register a trade_id for an internal_order_id so that journal
+        events use the same trade_id as the caller (e.g. runtime signal).
+        Must be called BEFORE submit_*_order for that internal_order_id."""
+        self._trade_ids_by_internal[internal_order_id] = trade_id
+
     def _trade_ids(self, internal_order_id: str) -> TradeIds:
         tid = self._trade_ids_by_internal.get(internal_order_id)
         if not tid:
@@ -948,10 +954,14 @@ class OrderExecutionEngine:
                 extra={"internal_order_id": internal_order_id},
             )
 
-            # Patch 2: durable transaction log fill
+        # Patch 2: durable transaction log fill + trade journal fill
+        # (independent of order_tracker — always log fills)
+        if to_state == OrderStatus.FILLED and filled_qty and fill_price:
+            ids = self._trade_ids(internal_order_id)
+            fill_symbol = self._order_metadata.get(internal_order_id, {}).get("symbol")
+
             if self.transaction_log is not None:
                 try:
-                    ids = self._trade_ids(internal_order_id)
                     self.transaction_log.append(
                         {
                             "event_type": "ORDER_FILLED",
@@ -959,13 +969,26 @@ class OrderExecutionEngine:
                             "trade_id": ids.trade_id,
                             "internal_order_id": internal_order_id,
                             "broker_order_id": broker_order_id,
-                            "symbol": self._order_metadata.get(internal_order_id, {}).get("symbol"),
+                            "symbol": fill_symbol,
                             "filled_qty": str(filled_qty),
                             "fill_price": str(fill_price),
                         }
                     )
                 except Exception:
                     pass
+
+            # PATCH 2: emit fill to trade journal (was missing)
+            self._j_emit(
+                build_trade_event(
+                    event_type="ORDER_FILLED",
+                    ids=ids,
+                    internal_order_id=internal_order_id,
+                    broker_order_id=broker_order_id,
+                    symbol=fill_symbol,
+                    qty=str(filled_qty),
+                    reason={"fill_price": str(fill_price)},
+                )
+            )
 
         # If filled, create/update position
         if to_state == OrderStatus.FILLED and filled_qty and fill_price:

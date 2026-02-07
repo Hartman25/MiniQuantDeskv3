@@ -990,6 +990,11 @@ def run(opts: RunOptions) -> int:
 
                         internal_id = f"{sig_strategy}-{uuid.uuid4().hex[:10]}"
 
+                        # PATCH 2: link signal trade_id to engine so journal
+                        # events share the same correlation identity.
+                        if exec_engine and hasattr(exec_engine, "register_trade_id"):
+                            exec_engine.register_trade_id(internal_id, trade_id)
+
                         stop_loss = sig.get("stop_loss")
                         take_profit = sig.get("take_profit")
                         if stop_loss is not None:
@@ -1024,6 +1029,7 @@ def run(opts: RunOptions) -> int:
                             journal.write_event(
                                 {
                                     "event": "order_submitted",
+                                    "trade_id": trade_id,
                                     "internal_order_id": internal_id,
                                     "broker_order_id": broker_order_id,
                                     "symbol": sig_symbol,

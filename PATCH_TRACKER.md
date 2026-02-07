@@ -23,7 +23,33 @@
   - ✅ No false positives (FILL events don't seed guard)
 
 ## PATCH 2: Enforce correlation IDs across journal + transaction log
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Ensured every order lifecycle event carries trade_id +
+  internal_order_id + broker_order_id (once known). Added fill events
+  to TradeJournal (was missing). Added `register_trade_id()` to engine
+  so runtime signals and engine journal events share the same trade_id.
+  Fixed missing trade_id in LIMIT order_submitted journal event.
+- **Files changed:**
+  - `core/execution/engine.py` — added `register_trade_id()`, added fill event to trade_journal, restructured fill logging to be independent of order_tracker
+  - `core/runtime/app.py` — added trade_id to LIMIT order_submitted event, added `register_trade_id()` call before order submission
+  - `tests/p1/test_patch2_correlation_ids_required.py` (NEW — 7 tests)
+- **Tests added:**
+  - `test_registered_trade_id_used_in_journal_events` — engine uses registered trade_id
+  - `test_unregistered_trade_id_is_auto_generated` — backwards compat
+  - `test_fill_event_in_trade_journal` — ORDER_FILLED in trade journal
+  - `test_fill_event_in_transaction_log` — ORDER_FILLED in transaction log
+  - `test_trade_journal_rejects_missing_trade_id` — validation enforcement
+  - `test_trade_journal_rejects_missing_internal_order_id` — validation enforcement
+  - `test_transaction_log_rejects_order_event_without_internal_id` — validation enforcement
+- **Commands run + results:**
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m py_compile core/execution/engine.py` → OK
+  - `python -m pytest -q` → 120 passed (tests/p1 excluded by pytest.ini norecursedirs)
+  - `python -m pytest tests/p1/test_patch2_correlation_ids_required.py -v` → 7 passed
+- **Done definition:**
+  - ✅ Every entry has trade_id + internal_order_id + broker_order_id (once known)
+  - ✅ Fill events appear in BOTH TradeJournal and TransactionLog with matching IDs
+  - ✅ Signal trade_id flows through to engine via register_trade_id()
 
 ## PATCH 3: Make throttling real on market-data path
 - **Status:** TODO
