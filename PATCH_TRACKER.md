@@ -121,7 +121,29 @@
   - ✅ 100% of existing tests still pass (120/120)
 
 ## PATCH 5: Make strategy decision purity enforceable
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `validate_signal_output()` and `check_broker_access()`
+  to `strategies/base.py`. The lifecycle manager now calls
+  `validate_signal_output()` on every `on_bar()` return and
+  `check_broker_access()` on `start_strategy()`. A strategy that returns
+  a bad type raises `StrategyPurityError` immediately. A strategy holding
+  a broker/engine reference is caught at startup.
+- **Files changed:**
+  - `strategies/base.py` — added `StrategyPurityError`, `validate_signal_output()`,
+    `check_broker_access()`, `_BROKER_ATTR_NAMES`
+  - `strategies/lifecycle.py` — `start_strategy()` calls `check_broker_access()`;
+    `on_bar()` calls `validate_signal_output()` and re-raises `StrategyPurityError`
+  - `tests/p1/test_patch5_strategy_purity.py` (NEW — 19 tests)
+- **Tests added:** 19 tests covering validation, broker detection, lifecycle integration
+- **Commands run + results:**
+  - `python -m py_compile strategies/base.py` → OK
+  - `python -m py_compile strategies/lifecycle.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch5_strategy_purity.py -v` → 19 passed
+- **Done definition:**
+  - ✅ Base class enforces on_bar returns list of signal dicts (or empty)
+  - ✅ Strategy cannot hold broker reference — caught at start time
+  - ✅ Bad strategy raises StrategyPurityError immediately
 
 ## PATCH 6: Persist and restore pending orders into the order state machine
 - **Status:** TODO

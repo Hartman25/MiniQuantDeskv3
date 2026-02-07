@@ -16,7 +16,7 @@ from decimal import Decimal
 import logging
 
 from core.data.contract import MarketDataContract
-from strategies.base import IStrategy
+from strategies.base import IStrategy, validate_signal_output, check_broker_access, StrategyPurityError
 
 try:
     from strategies.signals import StrategySignal
@@ -45,6 +45,8 @@ class StrategyLifecycleManager:
         if not s:
             raise ValueError(f"Strategy {name} not found")
         s.on_init()
+        # PATCH 5: purity check — strategy must not hold broker references
+        check_broker_access(s)
         s.enabled = True
         self._enabled.add(name)
         logger.info("Started strategy: %s", name)
@@ -62,6 +64,8 @@ class StrategyLifecycleManager:
         """
         Route bar to enabled strategies.
         Returns a list of legacy dict signals (normalized).
+
+        PATCH 5: Uses validate_signal_output() to enforce purity.
         """
         out: List[Dict] = []
 
@@ -74,30 +78,27 @@ class StrategyLifecycleManager:
                 continue
 
             try:
-                sig = s.on_bar(bar)
+                raw = s.on_bar(bar)
                 s.bars_processed += 1
 
-                if not sig:
-                    continue
+                # PATCH 5: validate + normalize through purity gate
+                signals = validate_signal_output(raw, strategy_name=s.name)
 
-                # Normalize typed -> dict
-                if StrategySignal is not None and isinstance(sig, StrategySignal):
-                    sig = sig.to_dict()
+                for sig in signals:
+                    s.signals_generated += 1
+                    out.append(sig)
 
-                if not isinstance(sig, dict):
-                    logger.warning("Strategy %s produced unsupported signal type: %s", s.name, type(sig))
-                    continue
+                    logger.info(
+                        "[%s] signal: %s %s %s",
+                        s.name,
+                        sig.get("side"),
+                        sig.get("quantity"),
+                        sig.get("symbol"),
+                    )
 
-                s.signals_generated += 1
-                out.append(sig)
-
-                logger.info(
-                    "[%s] signal: %s %s %s",
-                    s.name,
-                    sig.get("side"),
-                    sig.get("quantity"),
-                    sig.get("symbol"),
-                )
+            except StrategyPurityError:
+                # Re-raise purity violations — these are bugs, not transient
+                raise
 
             except Exception:
                 logger.exception("Error in strategy %s", name)
