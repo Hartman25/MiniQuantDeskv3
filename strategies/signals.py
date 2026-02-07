@@ -12,11 +12,18 @@ This module intentionally stays small and dependency-free.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from decimal import Decimal
 from typing import Optional, Dict, Any, Literal
 
 
 Side = Literal["BUY", "SELL"]
+
+class SignalType(str, Enum):
+    """Runtime-friendly signal side enum (string-valued)."""
+    BUY = "BUY"
+    SELL = "SELL"
+
 
 @dataclass(frozen=True)
 class StrategySignal:
@@ -40,6 +47,12 @@ class StrategySignal:
     take_profit: Optional[Decimal] = None
     reason: str = ""
     strategy: str = "UNKNOWN"
+
+
+    def __post_init__(self) -> None:
+        # Accept SignalType enum values as well as raw strings.
+        if isinstance(self.side, SignalType):
+            object.__setattr__(self, 'side', self.side.value)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -72,3 +85,5 @@ class StrategySignal:
             strategy=str(d.get("strategy", "UNKNOWN")),
         )
 
+# Back-compat alias (older code/tests expect these names)
+TradingSignal = StrategySignal

@@ -17,9 +17,11 @@ from datetime import datetime
 import threading
 import queue
 import time
+from strategies.signals import TradingSignal, SignalType
+
 
 from core.logging import get_logger, LogStream
-from core.strategy import TradingSignal, SignalType
+from strategies.signals import TradingSignal, SignalType
 from core.execution import OrderExecutionEngine
 from core.brokers import BrokerOrderSide
 from core.state import OrderStatus

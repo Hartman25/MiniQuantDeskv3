@@ -14,6 +14,9 @@ Based on observer pattern with thread-safety guarantees.
 
 import threading
 import queue
+import os
+import atexit
+import weakref
 from typing import Dict, List, Callable, Any, Type, Optional
 from dataclasses import dataclass, field
 import logging
@@ -21,6 +24,25 @@ from datetime import datetime
 from decimal import Decimal
 
 from core.logging import get_logger, LogStream
+
+# ============================================================================
+# GLOBAL REGISTRY (helps tests / interpreter shutdown)
+# ============================================================================
+
+# Weak registry of all instantiated buses so we can stop them at interpreter exit.
+_BUS_REGISTRY: "weakref.WeakSet[OrderEventBus]" = weakref.WeakSet()  # type: ignore[name-defined]
+
+def _stop_all_buses_at_exit() -> None:
+    # Best-effort cleanup so stray non-daemon threads don't hang pytest / interpreter shutdown.
+    for bus in list(_BUS_REGISTRY):
+        try:
+            if getattr(bus, "_running", False):
+                bus.stop(timeout=0.2)
+        except Exception:
+            # Never raise during interpreter shutdown
+            pass
+
+atexit.register(_stop_all_buses_at_exit)
 
 
 # ============================================================================
@@ -100,7 +122,7 @@ class OrderEventBus:
         bus.stop()
     """
     
-    def __init__(self, max_queue_size: int = 10000):
+    def __init__(self, max_queue_size: int = 10000, *, daemon: bool | None = None):
         """
         Initialize event bus.
         
@@ -120,7 +142,21 @@ class OrderEventBus:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         
-        # Statistics
+        
+
+        # Thread daemon mode:
+        # - In production we default to non-daemon for graceful shutdown.
+        # - Under pytest, stray non-daemon threads can hang the test runner.
+        if daemon is None:
+            daemon = bool(os.environ.get('PYTEST_CURRENT_TEST') or os.environ.get('PYTEST_RUNNING'))
+        self._daemon = bool(daemon)
+
+        # Track instances for best-effort cleanup at interpreter shutdown.
+        try:
+            _BUS_REGISTRY.add(self)  # type: ignore[arg-type]
+        except Exception:
+            pass
+# Statistics
         self._events_processed = 0
         self._events_failed = 0
         
@@ -205,7 +241,7 @@ class OrderEventBus:
         self._thread = threading.Thread(
             target=self._process_events,
             name="OrderEventBus",
-            daemon=False  # NOT daemon - want graceful shutdown
+            daemon=self._daemon  # auto-daemon under pytest to avoid hangs
         )
         self._thread.start()
         
@@ -340,6 +376,14 @@ class OrderEventBus:
                 )
                 self._events_failed += 1
     
+    def __del__(self):
+        """Best-effort cleanup if user forgot to call stop()."""
+        try:
+            if getattr(self, "_running", False):
+                self.stop(timeout=0.1)
+        except Exception:
+            pass
+
     def get_stats(self) -> Dict:
         """
         Get event bus statistics.

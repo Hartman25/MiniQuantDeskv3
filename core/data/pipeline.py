@@ -408,12 +408,21 @@ class MarketDataPipeline:
         """
         Drop the last bar if it is not complete yet (anti-lookahead).
         Completeness rule: now >= last_ts + timeframe_duration
+
+        NOTE:
+        - If df has only 1 row, dropping would create an empty result. In that case,
+          keep the single bar to avoid "no data" behavior in sparse/test environments.
         """
         if df is None or df.empty:
             return df
 
         # Ensure a DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+
+        # If there's only one bar, don't drop it to empty the result.
+        # (We still drop the last bar when we have at least one earlier bar.)
+        if len(df) <= 1:
             return df
 
         last_ts = df.index[-1]

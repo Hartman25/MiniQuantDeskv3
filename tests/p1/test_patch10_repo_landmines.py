@@ -157,19 +157,29 @@ class TestRepoLandmines:
 
     def test_no_import_from_protections_old(self):
         """No Python file should import from protections_old."""
-        pattern = re.compile(r'from\s+.*protections_old|import\s+.*protections_old')
+        pattern = re.compile(r'^\s*(from|import)\s+.*\bprotections_old\b')
 
         violations = []
         for rel_path in _git_tracked_files(".py"):
+            # Skip this file so we don't self-flag strings/comments/etc
+            if rel_path.replace("\\", "/") == "tests/p1/test_patch10_repo_landmines.py":
+                continue
+
             full = REPO_ROOT / rel_path
             if not full.exists():
                 continue
+
             try:
                 text = full.read_text(encoding="utf-8", errors="ignore")
             except Exception:
                 continue
+
             for i, line in enumerate(text.splitlines(), 1):
-                if pattern.search(line):
+                # Ignore commented-out lines
+                if line.lstrip().startswith("#"):
+                    continue
+                if pattern.match(line):
                     violations.append(f"{rel_path}:{i}")
 
         assert violations == [], f"Imports from protections_old: {violations}"
+
