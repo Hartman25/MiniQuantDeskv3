@@ -9,7 +9,6 @@ ARCHITECTURE:
 - Routes signals through risk gate
 - Handles graceful shutdown
 
-PATCH 3: Added live mode halt on reconciliation failures.
 
 Based on LEAN's Algorithm.Run() with enhanced safety.
 """
@@ -33,7 +32,7 @@ from core.runtime.circuit_breaker import ConsecutiveFailureBreaker
 from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus
 from core.recovery.persistence import StatePersistence
 from core.data.contract import MarketDataContract
-from core.data.validator import DataValidator
+from core.data.validator import DataValidator, DataValidationError
 from core.data.pipeline import DataPipelineError
 from core.di.container import Container
 from core.execution.engine import OrderExecutionEngine
@@ -449,6 +448,7 @@ def _synthetic_bar(symbol: str) -> MarketDataContract:
         provider="synthetic",
     )
 
+
 def run(opts: RunOptions) -> int:
     """Run the trading app. Returns exit code: 0 success, 1 safety halt/failure."""
     container = Container()
@@ -471,17 +471,9 @@ def run(opts: RunOptions) -> int:
 
     # Start services
     container.start()
-
-    # ===============================================================
-    # PATCH 5: Unified Journal (JSONL) for audit/ML
-    # ===============================================================
     journal_dir = Path(os.getenv("JOURNAL_DIR", "data/journal"))
     journal = JournalWriter(base_dir=journal_dir)
     journal.write_event({"event": "boot", "mode": opts.mode, "paper": paper})
-
-    # ===============================================================
-    # PATCH 1: Canonical Trade Journal (trade lifecycle, schema-versioned)
-    # ===============================================================
     trade_journal = TradeJournal(base_dir=journal_dir)
     trade_run_id = TradeJournal.new_run_id()
 
@@ -535,10 +527,6 @@ def run(opts: RunOptions) -> int:
         if recovery_status == RecoveryStatus.FAILED:
             logger.error("RECOVERY FAILED – halting runtime for safety")
             return 1
-
-        # ===============================================================
-        # PATCH 3 SAFETY: In LIVE mode, discrepancies at startup must halt
-        # ===============================================================
         if opts.mode == "live":
             try:
                 reconciler = container.get_reconciler() if hasattr(container, "get_reconciler") else None
@@ -554,10 +542,6 @@ def run(opts: RunOptions) -> int:
             if discrepancies:
                 logger.error("LIVE MODE HALT: startup reconciliation found discrepancies: %s", discrepancies)
                 return 1
-
-        # ===============================================================
-        # PATCH 2.1 + 2.4: Paper-mode startup reconcile (log-only or auto-heal)
-        # ===============================================================
         if opts.mode == "paper" and hasattr(container, "get_reconciler"):
             reconciler = None
             try:
@@ -666,7 +650,9 @@ def run(opts: RunOptions) -> int:
         state = _State()
 
         def _stop(_sig, _frame):
+            # Ask the loop to stop and also let Ctrl+C break out of sleeps/blocking calls
             state.running = False
+            raise KeyboardInterrupt
 
         signal.signal(signal.SIGINT, _stop)
         signal.signal(signal.SIGTERM, _stop)
@@ -676,6 +662,7 @@ def run(opts: RunOptions) -> int:
         cycle_count = 0
         orphan_check_interval = 10
 
+        orphan_counter = 0
         # P1 Patch 3: reload protective stops from broker on restart
         protective_stop_ids: Dict[str, str] = _load_protective_stops_from_broker(broker)
         if protective_stop_ids:
@@ -690,6 +677,17 @@ def run(opts: RunOptions) -> int:
 
         while state.running:
             try:
+                logger.info(
+                    "Cycle heartbeat",
+                    extra={
+                        "mode": opts.mode,
+                        "cycle": cycle_count,
+                        "symbols": len(all_symbols),
+                        "ts_utc": _utc_iso(),
+                    },
+                )
+                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1","true","yes"):
+                    print(f"[heartbeat] mode={opts.mode} cycle={cycle_count} ts_utc={_utc_iso()}")
                 acct = broker.get_account_info()
                 account_value = _safe_decimal(acct.get("portfolio_value", "0"))
                 buying_power = _safe_decimal(acct.get("buying_power", "0"))
@@ -709,25 +707,58 @@ def run(opts: RunOptions) -> int:
                         try:
                             df = _get_latest_bars_compat(data_pipeline, symbol, lookback, timeframe)
                             bars = _df_to_contracts(symbol, df)
+
+                            # In PAPER/LIVE, act only on fully closed bars (anti-lookahead).
+                            if opts.mode in ("paper", "live") and bars and not no_market_data_mode:
+                                while bars and not bars[-1].is_complete(timeframe):
+                                    bars.pop()
+
                             if not bars:
-                                # If provider returned nothing, fall back to a synthetic bar so signals can still be processed.
+                                # In harness mode we can synthesize; in PAPER/LIVE we skip this cycle.
+                                if opts.mode in ("paper", "live") and not no_market_data_mode:
+                                    journal.write_event(
+                                        {
+                                            "event": "market_data_incomplete_or_empty",
+                                            "symbol": symbol,
+                                            "reason": "no_closed_bars_available",
+                                        }
+                                    )
+                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1","true","yes"):
+                                        print(f"[data] {symbol}: no_closed_bars_available (market likely closed)")
+                                    continue
+
                                 bar = _synthetic_bar(symbol)
                                 bars = [bar]
                             else:
                                 bar = bars[-1]
+
                         except DataPipelineError as e:
-                            journal.write_event({'event': 'market_data_block', 'symbol': symbol, 'reason': str(e)})
-                            logger.warning('Market data blocked; skipping symbol', extra={'symbol': symbol, 'error': str(e)})
+                            journal.write_event({"event": "market_data_block", "symbol": symbol, "reason": str(e)})
+                            logger.warning(
+                                "Market data blocked; skipping symbol",
+                                extra={"symbol": symbol, "error": str(e)},
+                            )
                             continue
                         except Exception as e:
-                            journal.write_event({'event': 'market_data_error', 'symbol': symbol, 'error': str(e)})
-                            logger.exception('Market data error; skipping symbol', extra={'symbol': symbol})
+                            journal.write_event({"event": "market_data_error", "symbol": symbol, "error": str(e)})
+                            logger.exception("Market data error; skipping symbol", extra={"symbol": symbol})
                             continue
-
                     # ---- validation (skip/soften in harness mode) ----
                     try:
                         if isinstance(data_validator, DataValidator):
                             data_validator.validate_bars(bars=bars, timeframe=timeframe)
+                    except DataValidationError as e:
+                        # In PAPER/LIVE, bad/incomplete data should skip the symbol/cycle, not crash the loop.
+                        if opts.mode in ("paper", "live") and not no_market_data_mode:
+                            journal.write_event(
+                                {"event": "market_data_invalid", "symbol": symbol, "error": str(e)}
+                            )
+                            logger.warning(
+                                "Invalid market data; skipping symbol",
+                                extra={"symbol": symbol, "error": str(e)},
+                            )
+                            continue
+                        raise
                     except Exception:
                         # In harness mode, fake bars/strategies may not satisfy validator constraints.
                         if not no_market_data_mode:
@@ -767,8 +798,6 @@ def run(opts: RunOptions) -> int:
                         sig_limit = sig.get("limit_price")
                         sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(str(sig.get("price", getattr(bar, "close", Decimal("0")))))
                         sig_strategy = sig.get("strategy", "UNKNOWN")
-
-                        # PATCH 2.6: single-trade-at-a-time guard (block entries if position or open order exists)
                         if not _is_exit_signal(sig):
                             try:
                                 open_orders = []
@@ -830,8 +859,6 @@ def run(opts: RunOptions) -> int:
                                     "reason": f"guard_error:{type(e).__name__}",
                                 })
                                 continue
-
-                        # PATCH 2.5: runtime cooldown gate (anti-spam / idempotency)
                         key = _cooldown_key(sig_strategy, sig_symbol, side_str)
                         now_ts = time.time()
                         last_ts = last_action_ts.get(key, 0.0)
@@ -1208,10 +1235,10 @@ def run(opts: RunOptions) -> int:
                                     position_store.delete(sig_symbol)
                             except Exception:
                                 logger.warning("PositionStore update failed", exc_info=True)
-
                 cycle_count += 1
-                if cycle_count >= orphan_check_interval:
-                    cycle_count = 0
+                orphan_counter += 1
+                if orphan_counter >= orphan_check_interval:
+                    orphan_counter = 0
                     try:
                         order_tracker = container.get_order_tracker()
                         broker_orders_list = broker.get_orders()
@@ -1234,16 +1261,22 @@ def run(opts: RunOptions) -> int:
                             logger.info("Orphan check: No drift detected")
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
-
                 # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()
 
                 if opts.run_once:
                     state.running = False
                     break
-
                 if opts.run_interval_s > 0:
-                    time.sleep(opts.run_interval_s)
+                    try:
+                        try:
+                            time.sleep(opts.run_interval_s)
+                        except KeyboardInterrupt:
+                            return 0
+
+                    except KeyboardInterrupt:
+                        state.running = False
+                        break
 
             except Exception as e:
                 try:
