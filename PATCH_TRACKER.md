@@ -246,7 +246,43 @@
   - ✅ Auditable trail for both pass and reject outcomes
 
 ## PATCH 9: Make protective-stop lifecycle authoritative
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `StopLifecycleManager` and `StopLifecycleEvent` to
+  `core/risk/protections/stop_lifecycle.py`.  Centralises the create/cancel/
+  restore lifecycle of protective stop orders with journal-ready events for
+  every transition.  Idempotent: duplicate place returns already_exists,
+  cancel on missing returns not_found.  Supports crash recovery via
+  `restore_from_events()`.  Thread-safe.
+- **Files changed:**
+  - `core/risk/protections/stop_lifecycle.py` (NEW)
+  - `tests/p1/test_patch9_stop_lifecycle.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_place_stores_stop` — place creates entry
+  - `test_cancel_removes_stop` — cancel removes entry
+  - `test_get_stop_id_returns_id` — query returns correct ID
+  - `test_get_stop_id_returns_none` — query returns None
+  - `test_has_stop` — boolean check
+  - `test_active_stops_snapshot` — full snapshot
+  - `test_idempotent_place` — duplicate place is no-op
+  - `test_idempotent_cancel` — cancel on missing is no-op
+  - `test_restore_from_events` — replay placed+cancelled correctly
+  - `test_restore_skips_already_active` — doesn't overwrite existing
+  - `test_event_to_dict_has_required_keys` — event shape
+  - `test_count_property` — active count
+  - `test_history_records_all_events` — full audit trail
+  - `test_thread_safety` — concurrent place/cancel
+  - `test_cancel_after_cancel` — double cancel
+  - `test_place_with_stop_price` — stop_price in event
+- **Commands run + results:**
+  - `python -m py_compile core/risk/protections/stop_lifecycle.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch9_stop_lifecycle.py -v` → 16 passed
+- **Done definition:**
+  - ✅ Single source of truth for active protective stops
+  - ✅ Every lifecycle transition produces journal-ready event
+  - ✅ Crash recovery via restore_from_events()
+  - ✅ Idempotent place/cancel (no-op on duplicate)
 
 ## PATCH 10: Remove repo landmines
 - **Status:** TODO
