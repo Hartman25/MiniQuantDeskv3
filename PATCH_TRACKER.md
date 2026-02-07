@@ -52,7 +52,45 @@
   - ✅ Signal trade_id flows through to engine via register_trade_id()
 
 ## PATCH 3: Make throttling real on market-data path
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `execute_sync()` method to the `Throttler` class so
+  synchronous callers (like `MarketDataPipeline._fetch_from_alpaca()`) can use
+  rate limiting without asyncio.  The pipeline was already calling
+  `throttler.execute_sync('alpaca_data', _do_call)` but the method didn't
+  exist — now it does.  Also removed ~200 lines of orphaned duplicate code
+  (duplicate `_wait_if_needed`, `get_stats`, `reset_stats`, `ExponentialBackoff`,
+  and factory functions) from the bottom of `throttler.py`.
+- **Files changed:**
+  - `core/net/throttler.py` — added `execute_sync()` method; removed orphaned
+    duplicate code (lines 362-557 were dead after `create_combined_throttler()`
+    return)
+  - `tests/p1/test_patch3_pipeline_throttler_used.py` (NEW — 13 tests)
+- **Tests added:**
+  - `test_execute_sync_is_callable` — method exists
+  - `test_execute_sync_forwards_result` — returns function result
+  - `test_execute_sync_passes_args` — positional args forwarded
+  - `test_execute_sync_passes_kwargs` — keyword args forwarded
+  - `test_single_fetch_increments_call_count` — pipeline uses throttler
+  - `test_repeated_fetches_increment_call_count` — each fetch goes through throttler
+  - `test_cache_hit_does_not_call_throttler` — cache avoids redundant throttle
+  - `test_stats_increment_after_execute_sync` — stats track sync calls
+  - `test_reset_stats_clears_execute_sync_counts` — reset works for sync
+  - `test_blocks_when_limit_reached` — functional rate limiting test
+  - `test_no_duplicate_exponential_backoff` — dead code removed
+  - `test_no_duplicate_create_combined` — dead code removed
+  - `test_file_line_count_reasonable` — file size sanity check
+- **Commands run + results:**
+  - `python -m py_compile core/net/throttler.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m py_compile core/data/pipeline.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch3_pipeline_throttler_used.py -v` → 13 passed
+  - `python entry_paper.py --once` → pre-existing failure (placeholder API keys)
+- **Done definition:**
+  - ✅ Market-data requests go through throttler wrapper (`execute_sync`)
+  - ✅ Test asserts call count increments under repeated fetch
+  - ✅ Dead duplicate code removed from throttler.py
+  - ✅ Stats correctly track sync calls
 
 ## PATCH 4: Split runtime loop into coordinator + pure steps
 - **Status:** TODO
