@@ -1,4 +1,15 @@
-# MiniQuantDesk
+<p align="center">
+  <img src="assets/logo/miniquantdesk_logo_shield_terminal.png"
+       alt="MiniQuantDesk"
+       width="600">
+</p>
+
+<h1 align="center">MiniQuantDesk</h1>
+
+<p align="center">
+  Safety-first quantitative trading runtime
+</p>
+
 
 **MiniQuantDesk** is a safety-first, modular quantitative trading runtime designed to validate execution correctness, risk controls, and system integrity before scaling to live capital.
 
