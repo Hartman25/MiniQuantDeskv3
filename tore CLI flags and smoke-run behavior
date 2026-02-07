@@ -1,0 +1,447 @@
+[1mdiff --git a/core/runtime/app.py b/core/runtime/app.py[m
+[1mindex 042e428..aa94092 100644[m
+[1m--- a/core/runtime/app.py[m
+[1m+++ b/core/runtime/app.py[m
+[36m@@ -9,7 +9,6 @@[m [mARCHITECTURE:[m
+ - Routes signals through risk gate[m
+ - Handles graceful shutdown[m
+ [m
+[31m-PATCH 3: Added live mode halt on reconciliation failures.[m
+ [m
+ Based on LEAN's Algorithm.Run() with enhanced safety.[m
+ """[m
+[36m@@ -33,7 +32,7 @@[m [mfrom core.runtime.circuit_breaker import ConsecutiveFailureBreaker[m
+ from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus[m
+ from core.recovery.persistence import StatePersistence[m
+ from core.data.contract import MarketDataContract[m
+[31m-from core.data.validator import DataValidator[m
+[32m+[m[32mfrom core.data.validator import DataValidator, DataValidationError[m
+ from core.data.pipeline import DataPipelineError[m
+ from core.di.container import Container[m
+ from core.execution.engine import OrderExecutionEngine[m
+[36m@@ -449,6 +448,7 @@[m [mdef _synthetic_bar(symbol: str) -> MarketDataContract:[m
+         provider="synthetic",[m
+     )[m
+ [m
+[32m+[m
+ def run(opts: RunOptions) -> int:[m
+     """Run the trading app. Returns exit code: 0 success, 1 safety halt/failure."""[m
+     container = Container()[m
+[36m@@ -471,17 +471,9 @@[m [mdef run(opts: RunOptions) -> int:[m
+ [m
+     # Start services[m
+     container.start()[m
+[31m-[m
+[31m-    # ===============================================================[m
+[31m-    # PATCH 5: Unified Journal (JSONL) for audit/ML[m
+[31m-    # ===============================================================[m
+     journal_dir = Path(os.getenv("JOURNAL_DIR", "data/journal"))[m
+     journal = JournalWriter(base_dir=journal_dir)[m
+     journal.write_event({"event": "boot", "mode": opts.mode, "paper": paper})[m
+[31m-[m
+[31m-    # ===============================================================[m
+[31m-    # PATCH 1: Canonical Trade Journal (trade lifecycle, schema-versioned)[m
+[31m-    # ===============================================================[m
+     trade_journal = TradeJournal(base_dir=journal_dir)[m
+     trade_run_id = TradeJournal.new_run_id()[m
+ [m
+[36m@@ -535,10 +527,6 @@[m [mdef run(opts: RunOptions) -> int:[m
+         if recovery_status == RecoveryStatus.FAILED:[m
+             logger.error("RECOVERY FAILED – halting runtime for safety")[m
+             return 1[m
+[31m-[m
+[31m-        # ===============================================================[m
+[31m-        # PATCH 3 SAFETY: In LIVE mode, discrepancies at startup must halt[m
+[31m-        # ===============================================================[m
+         if opts.mode == "live":[m
+             try:[m
+                 reconciler = container.get_reconciler() if hasattr(container, "get_reconciler") else None[m
+[36m@@ -554,10 +542,6 @@[m [mdef run(opts: RunOptions) -> int:[m
+             if discrepancies:[m
+                 logger.error("LIVE MODE HALT: startup reconciliation found discrepancies: %s", discrepancies)[m
+                 return 1[m
+[31m-[m
+[31m-        # ===============================================================[m
+[31m-        # PATCH 2.1 + 2.4: Paper-mode startup reconcile (log-only or auto-heal)[m
+[31m-        # ===============================================================[m
+         if opts.mode == "paper" and hasattr(container, "get_reconciler"):[m
+             reconciler = None[m
+             try:[m
+[36m@@ -666,7 +650,9 @@[m [mdef run(opts: RunOptions) -> int:[m
+         state = _State()[m
+ [m
+         def _stop(_sig, _frame):[m
+[32m+[m[32m            # Ask the loop to stop and also let Ctrl+C break out of sleeps/blocking calls[m
+             state.running = False[m
+[32m+[m[32m            raise KeyboardInterrupt[m
+ [m
+         signal.signal(signal.SIGINT, _stop)[m
+         signal.signal(signal.SIGTERM, _stop)[m
+[36m@@ -676,6 +662,7 @@[m [mdef run(opts: RunOptions) -> int:[m
+         cycle_count = 0[m
+         orphan_check_interval = 10[m
+ [m
+[32m+[m[32m        orphan_counter = 0[m
+         # P1 Patch 3: reload protective stops from broker on restart[m
+         protective_stop_ids: Dict[str, str] = _load_protective_stops_from_broker(broker)[m
+         if protective_stop_ids:[m
+[36m@@ -690,6 +677,17 @@[m [mdef run(opts: RunOptions) -> int:[m
+ [m
+         while state.running:[m
+             try:[m
+[32m+[m[32m                logger.info([m
+[32m+[m[32m                    "Cycle heartbeat",[m
+[32m+[m[32m                    extra={[m
+[32m+[m[32m                        "mode": opts.mode,[m
+[32m+[m[32m                        "cycle": cycle_count,[m
+[32m+[m[32m                        "symbols": len(all_symbols),[m
+[32m+[m[32m                        "ts_utc": _utc_iso(),[m
+[32m+[m[32m                    },[m
+[32m+[m[32m                )[m
+[32m+[m[32m                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1","true","yes"):[m
+[32m+[m[32m                    print(f"[heartbeat] mode={opts.mode} cycle={cycle_count} ts_utc={_utc_iso()}")[m
+                 acct = broker.get_account_info()[m
+                 account_value = _safe_decimal(acct.get("portfolio_value", "0"))[m
+                 buying_power = _safe_decimal(acct.get("buying_power", "0"))[m
+[36m@@ -709,25 +707,58 @@[m [mdef run(opts: RunOptions) -> int:[m
+                         try:[m
+                             df = _get_latest_bars_compat(data_pipeline, symbol, lookback, timeframe)[m
+                             bars = _df_to_contracts(symbol, df)[m
+[32m+[m
+[32m+[m[32m                            # In PAPER/LIVE, act only on fully closed bars (anti-lookahead).[m
+[32m+[m[32m                            if opts.mode in ("paper", "live") and bars and not no_market_data_mode:[m
+[32m+[m[32m                                while bars and not bars[-1].is_complete(timeframe):[m
+[32m+[m[32m                                    bars.pop()[m
+[32m+[m
+                             if not bars:[m
+[31m-                                # If provider returned nothing, fall back to a synthetic bar so signals can still be processed.[m
+[32m+[m[32m                                # In harness mode we can synthesize; in PAPER/LIVE we skip this cycle.[m
+[32m+[m[32m                                if opts.mode in ("paper", "live") and not no_market_data_mode:[m
+[32m+[m[32m                                    journal.write_event([m
+[32m+[m[32m                                        {[m
+[32m+[m[32m                                            "event": "market_data_incomplete_or_empty",[m
+[32m+[m[32m                                            "symbol": symbol,[m
+[32m+[m[32m                                            "reason": "no_closed_bars_available",[m
+[32m+[m[32m                                        }[m
+[32m+[m[32m                                    )[m
+[32m+[m[32m                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1","true","yes"):[m
+[32m+[m[32m                                        print(f"[data] {symbol}: no_closed_bars_available (market likely closed)")[m
+[32m+[m[32m                                    continue[m
+[32m+[m
+                                 bar = _synthetic_bar(symbol)[m
+                                 bars = [bar][m
+                             else:[m
+                                 bar = bars[-1][m
+[32m+[m
+                         except DataPipelineError as e:[m
+[31m-                            journal.write_event({'event': 'market_data_block', 'symbol': symbol, 'reason': str(e)})[m
+[31m-                            logger.warning('Market data blocked; skipping symbol', extra={'symbol': symbol, 'error': str(e)})[m
+[32m+[m[32m                            journal.write_event({"event": "market_data_block", "symbol": symbol, "reason": str(e)})[m
+[32m+[m[32m                            logger.warning([m
+[32m+[m[32m                                "Market data blocked; skipping symbol",[m
+[32m+[m[32m                                extra={"symbol": symbol, "error": str(e)},[m
+[32m+[m[32m                            )[m
+                             continue[m
+                         except Exception as e:[m
+[31m-                            journal.write_event({'event': 'market_data_error', 'symbol': symbol, 'error': str(e)})[m
+[31m-                            logger.exception('Market data error; skipping symbol', extra={'symbol': symbol})[m
+[32m+[m[32m                            journal.write_event({"event": "market_data_error", "symbol": symbol, "error": str(e)})[m
+[32m+[m[32m                            logger.exception("Market data error; skipping symbol", extra={"symbol": symbol})[m
+                             continue[m
+[31m-[m
+                     # ---- validation (skip/soften in harness mode) ----[m
+                     try:[m
+                         if isinstance(data_validator, DataValidator):[m
+                             data_validator.validate_bars(bars=bars, timeframe=timeframe)[m
+[32m+[m[32m                    except DataValidationError as e:[m
+[32m+[m[32m                        # In PAPER/LIVE, bad/incomplete data should skip the symbol/cycle, not crash the loop.[m
+[32m+[m[32m                        if opts.mode in ("paper", "live") and not no_market_data_mode:[m
+[32m+[m[32m                            journal.write_event([m
+[32m+[m[32m                                {"event": "market_data_invalid", "symbol": symbol, "error": str(e)}[m
+[32m+[m[32m                            )[m
+[32m+[m[32m                            logger.warning([m
+[32m+[m[32m                                "Invalid market data; skipping symbol",[m
+[32m+[m[32m                                extra={"symbol": symbol, "error": str(e)},[m
+[32m+[m[32m                            )[m
+[32m+[m[32m                            continue[m
+[32m+[m[32m                        raise[m
+                     except Exception:[m
+                         # In harness mode, fake bars/strategies may not satisfy validator constraints.[m
+                         if not no_market_data_mode:[m
+[36m@@ -767,8 +798,6 @@[m [mdef run(opts: RunOptions) -> int:[m
+                         sig_limit = sig.get("limit_price")[m
+                         sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(str(sig.get("price", getattr(bar, "close", Decimal("0")))))[m
+                         sig_strategy = sig.get("strategy", "UNKNOWN")[m
+[31m-[m
+[31m-                        # PATCH 2.6: single-trade-at-a-time guard (block entries if position or open order exists)[m
+                         if not _is_exit_signal(sig):[m
+                             try:[m
+                                 open_orders = [][m
+[36m@@ -830,8 +859,6 @@[m [mdef run(opts: RunOptions) -> int:[m
+                                     "reason": f"guard_error:{type(e).__name__}",[m
+                                 })[m
+                                 continue[m
+[31m-[m
+[31m-                        # PATCH 2.5: runtime cooldown gate (anti-spam / idempotency)[m
+                         key = _cooldown_key(sig_strategy, sig_symbol, side_str)[m
+                         now_ts = time.time()[m
+                         last_ts = last_action_ts.get(key, 0.0)[m
+[36m@@ -1208,10 +1235,10 @@[m [mdef run(opts: RunOptions) -> int:[m
+                                     position_store.delete(sig_symbol)[m
+                             except Exception:[m
+                                 logger.warning("PositionStore update failed", exc_info=True)[m
+[31m-[m
+                 cycle_count += 1[m
+[31m-                if cycle_count >= orphan_check_interval:[m
+[31m-                    cycle_count = 0[m
+[32m+[m[32m                orphan_counter += 1[m
+[32m+[m[32m                if orphan_counter >= orphan_check_interval:[m
+[32m+[m[32m                    orphan_counter = 0[m
+                     try:[m
+                         order_tracker = container.get_order_tracker()[m
+                         broker_orders_list = broker.get_orders()[m
+[36m@@ -1234,16 +1261,22 @@[m [mdef run(opts: RunOptions) -> int:[m
+                             logger.info("Orphan check: No drift detected")[m
+                     except Exception as e:[m
+                         logger.error(f"Orphan check failed: {e}", exc_info=True)[m
+[31m-[m
+                 # ✅ success path only: reset breaker after a full successful cycle[m
+                 _circuit_breaker.record_success()[m
+ [m
+                 if opts.run_once:[m
+                     state.running = False[m
+                     break[m
+[31m-[m
+                 if opts.run_interval_s > 0:[m
+[31m-                    time.sleep(opts.run_interval_s)[m
+[32m+[m[32m                    try:[m
+[32m+[m[32m                        try:[m
+[32m+[m[32m                            time.sleep(opts.run_interval_s)[m
+[32m+[m[32m                        except KeyboardInterrupt:[m
+[32m+[m[32m                            return 0[m
+[32m+[m
+[32m+[m[32m                    except KeyboardInterrupt:[m
+[32m+[m[32m                        state.running = False[m
+[32m+[m[32m                        break[m
+ [m
+             except Exception as e:[m
+                 try:[m
+[1mdiff --git a/entry_live.py b/entry_live.py[m
+[1mindex cb6d387..7af5046 100644[m
+[1m--- a/entry_live.py[m
+[1m+++ b/entry_live.py[m
+[36m@@ -1,9 +1,76 @@[m
+ from __future__ import annotations[m
+ [m
+[32m+[m[32mimport argparse[m
+[32m+[m[32mimport sys[m
+ from pathlib import Path[m
+ [m
+[31m-from core.runtime.app import RunOptions, run_app[m
+[32m+[m[32mfrom core.runtime.app import RunOptions, run[m
+ [m
+ [m
+[31m-def run_live(config_path: Path, run_once: bool = False) -> int:[m
+[31m-    return run_app(RunOptions(config_path=config_path, mode="live", run_once=run_once))[m
+[32m+[m[32mdef _parse_args(argv: list[str]) -> argparse.Namespace:[m
+[32m+[m[32m    p = argparse.ArgumentParser([m
+[32m+[m[32m        prog="entry_live",[m
+[32m+[m[32m        description="Run MiniQuantDesk in LIVE trading mode. Use with extreme caution.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--config",[m
+[32m+[m[32m        "-c",[m
+[32m+[m[32m        type=Path,[m
+[32m+[m[32m        default=(Path(__file__).resolve().parent / "config" / "config_micro.yaml"),[m
+[32m+[m[32m        help="Path to config YAML (default: ./config/config_micro.yaml)",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--interval",[m
+[32m+[m[32m        "-i",[m
+[32m+[m[32m        type=int,[m
+[32m+[m[32m        default=60,[m
+[32m+[m[32m        help="Loop interval in seconds (default: 60). Ignored when --once is set.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--once",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help="Run exactly one cycle and exit (used for live connectivity smoke tests).",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--i-know-what-im-doing",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help="Required for LIVE mode. Prevents accidental execution.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    return p.parse_args(argv)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef run_live(*, config_path: Path, run_interval_s: int = 60, run_once: bool = False) -> int:[m
+[32m+[m[32m    return run([m
+[32m+[m[32m        RunOptions([m
+[32m+[m[32m            config_path=config_path,[m
+[32m+[m[32m            mode="live",[m
+[32m+[m[32m            run_interval_s=run_interval_s,[m
+[32m+[m[32m            run_once=run_once,[m
+[32m+[m[32m        )[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef main(argv: list[str] | None = None) -> int:[m
+[32m+[m[32m    args = _parse_args(sys.argv[1:] if argv is None else argv)[m
+[32m+[m
+[32m+[m[32m    if not args.i_know_what_im_doing:[m
+[32m+[m[32m        print("[entry_live] Refusing to run LIVE without --i-know-what-im-doing", file=sys.stderr)[m
+[32m+[m[32m        return 2[m
+[32m+[m
+[32m+[m[32m    cfg_path: Path = args.config.expanduser().resolve()[m
+[32m+[m[32m    if not cfg_path.exists():[m
+[32m+[m[32m        print(f"[entry_live] ERROR: config file not found: {cfg_path}", file=sys.stderr)[m
+[32m+[m[32m        return 2[m
+[32m+[m[32m    if cfg_path.is_dir():[m
+[32m+[m[32m        print([m
+[32m+[m[32m            f"[entry_live] ERROR: config path is a directory (expected a YAML file): {cfg_path}",[m
+[32m+[m[32m            file=sys.stderr,[m
+[32m+[m[32m        )[m
+[32m+[m[32m        return 2[m
+[32m+[m
+[32m+[m[32m    interval = 0 if args.once else max(1, int(args.interval))[m
+[32m+[m[32m    return run_live(config_path=cfg_path, run_interval_s=interval, run_once=bool(args.once))[m
+[32m+[m
+[32m+[m
+[32m+[m[32mif __name__ == "__main__":[m
+[32m+[m[32m    raise SystemExit(main())[m
+[1mdiff --git a/entry_paper.py b/entry_paper.py[m
+[1mindex b6d0c42..8fb1007 100644[m
+[1m--- a/entry_paper.py[m
+[1m+++ b/entry_paper.py[m
+[36m@@ -1,18 +1,125 @@[m
+ from __future__ import annotations[m
+ [m
+[32m+[m[32mimport argparse[m
+[32m+[m[32mimport sys[m
+[32m+[m[32mimport os[m
+ from pathlib import Path[m
+[32m+[m
+ from core.runtime.app import RunOptions, run[m
+ [m
+[31m-def run_paper(config_path: Path, run_interval_s: int = 60):[m
+[32m+[m
+[32m+[m[32mdef _parse_args(argv: list[str]) -> argparse.Namespace:[m
+[32m+[m[32m    p = argparse.ArgumentParser([m
+[32m+[m[32m        prog="entry_paper",[m
+[32m+[m[32m        description="Run MiniQuantDesk in PAPER trading mode.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--config",[m
+[32m+[m[32m        "-c",[m
+[32m+[m[32m        type=Path,[m
+[32m+[m[32m        default=(Path(__file__).resolve().parent / "config" / "config_micro.yaml"),[m
+[32m+[m[32m        help="Path to config YAML (default: ./config/config_micro.yaml)",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--interval",[m
+[32m+[m[32m        "-i",[m
+[32m+[m[32m        type=int,[m
+[32m+[m[32m        default=60,[m
+[32m+[m[32m        help="Loop interval in seconds (default: 60). Ignored when --once is set.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--once",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help="Run exactly one cycle and exit (used for smoke tests).",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    p.add_argument([m
+[32m+[m[32m        "--env-check",[m
+[32m+[m[32m        action="store_true",[m
+[32m+[m[32m        help="Print whether API env vars were loaded (no secrets) and exit.",[m
+[32m+[m[32m    )[m
+[32m+[m[32m    return p.parse_args(argv)[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef run_paper(*, config_path: Path, run_interval_s: int = 60, run_once: bool = False) -> int:[m
+     return run([m
+         RunOptions([m
+             config_path=config_path,[m
+             mode="paper",[m
+[31m-            run_interval_s=run_interval_s[m
+[32m+[m[32m            run_interval_s=run_interval_s,[m
+[32m+[m[32m            run_once=run_once,[m
+         )[m
+     )[m
+ [m
+[32m+[m
+[32m+[m[32mdef _load_env_local(cfg_path: Path) -> Path | None:[m
+[32m+[m[32m    """[m
+[32m+[m[32m    Loads KEY=VALUE lines into os.environ (if key not already set).[m
+[32m+[m[32m    Returns the Path that was loaded, or None.[m
+[32m+[m[32m    """[m
+[32m+[m[32m    env_candidates = [[m
+[32m+[m[32m        cfg_path.parent / ".env.local",  # next to chosen YAML (your case: ./config/.env.local)[m
+[32m+[m[32m        Path(__file__).resolve().parent / "config" / ".env.local",[m
+[32m+[m[32m        Path(__file__).resolve().parent / ".env.local",[m
+[32m+[m[32m    ][m
+[32m+[m
+[32m+[m[32m    for env_path in env_candidates:[m
+[32m+[m[32m        if env_path.exists():[m
+[32m+[m[32m            for line in env_path.read_text(encoding="utf-8").splitlines():[m
+[32m+[m[32m                line = line.strip()[m
+[32m+[m[32m                if not line or line.startswith("#") or "=" not in line:[m
+[32m+[m[32m                    continue[m
+[32m+[m[32m                k, v = line.split("=", 1)[m
+[32m+[m[32m                k, v = k.strip(), v.strip().strip('"').strip("'")[m
+[32m+[m[32m                if k and k not in os.environ:[m
+[32m+[m[32m                    os.environ[k] = v[m
+[32m+[m[32m            return env_path[m
+[32m+[m[32m    return None[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef _apply_env_aliases() -> None:[m
+[32m+[m[32m    # Compatibility aliases: allow BROKER_* but also expose ALPACA_* names[m
+[32m+[m[32m    if os.getenv("BROKER_API_KEY") and not os.getenv("ALPACA_API_KEY"):[m
+[32m+[m[32m        os.environ["ALPACA_API_KEY"] = os.getenv("BROKER_API_KEY", "")[m
+[32m+[m[32m    if os.getenv("BROKER_API_SECRET") and not os.getenv("ALPACA_API_SECRET"):[m
+[32m+[m[32m        os.environ["ALPACA_API_SECRET"] = os.getenv("BROKER_API_SECRET", "")[m
+[32m+[m
+[32m+[m
+[32m+[m[32mdef main(argv: list[str] | None = None) -> int:[m
+[32m+[m[32m    args = _parse_args(sys.argv[1:] if argv is None else argv)[m
+[32m+[m
+[32m+[m[32m    cfg_path: Path = args.config.expanduser().resolve()[m
+[32m+[m[32m    if not cfg_path.exists():[m
+[32m+[m[32m        print(f"[entry_paper] ERROR: config file not found: {cfg_path}", file=sys.stderr)[m
+[32m+[m[32m        return 2[m
+[32m+[m[32m    if cfg_path.is_dir():[m
+[32m+[m[32m        print([m
+[32m+[m[32m            f"[entry_paper] ERROR: config path is a directory (expected a YAML file): {cfg_path}",[m
+[32m+[m[32m            file=sys.stderr,[m
+[32m+[m[32m        )[m
+[32m+[m[32m        return 2[m
+[32m+[m
+[32m+[m[32m    loaded_env = _load_env_local(cfg_path)[m
+[32m+[m[32m    _apply_env_aliases()[m
+[32m+[m
+[32m+[m[32m    if args.env_check:[m
+[32m+[m[32m        print([m
+[32m+[m[32m            "[env-check]",[m
+[32m+[m[32m            f"loaded_env_file={str(loaded_env) if loaded_env else 'NONE'}",[m
+[32m+[m[32m            f"BROKER_API_KEY={bool(os.getenv('BROKER_API_KEY'))}",[m
+[32m+[m[32m            f"BROKER_API_SECRET={bool(os.getenv('BROKER_API_SECRET'))}",[m
+[32m+[m[32m            f"ALPACA_API_KEY={bool(os.getenv('ALPACA_API_KEY'))}",[m
+[32m+[m[32m            f"ALPACA_API_SECRET={bool(os.getenv('ALPACA_API_SECRET'))}",[m
+[32m+[m[32m        )[m
+[32m+[m[32m        return 0[m
+[32m+[m
+[32m+[m[32m    interval = 0 if args.once else max(1, int(args.interval))[m
+[32m+[m
+[32m+[m[32m    return run_paper([m
+[32m+[m[32m        config_path=cfg_path,[m
+[32m+[m[32m        run_interval_s=interval,[m
+[32m+[m[32m        run_once=bool(args.once),[m
+[32m+[m[32m    )[m
+[32m+[m
+[32m+[m
+ if __name__ == "__main__":[m
+[31m-    base = Path(__file__).resolve().parent[m
+[31m-    cfg = base / "config" / "config_micro.yaml"   # or switch to config.yaml later[m
+[31m-    raise SystemExit(run_paper(cfg, run_interval_s=60))[m
+[32m+[m[32m    raise SystemExit(main())[m

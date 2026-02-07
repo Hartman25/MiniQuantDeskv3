@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
-
+import re
 import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -133,64 +133,88 @@ class MarketDataPipeline:
         })
     
     def get_latest_bars(
-        self,
-        symbol: str,
-        lookback_bars: int = 100,
-        timeframe: str = "1Min"
-    ) -> pd.DataFrame:
+    self,
+    symbol: str,
+    lookback_bars: int = 100,
+    timeframe: str = "1Min",
+) -> pd.DataFrame:
         """
         Get latest bars for symbol.
-        
+
         Args:
             symbol: Stock symbol
             lookback_bars: Number of bars to retrieve
             timeframe: "1Min", "5Min", "1Hour", "1Day"
-            
+
         Returns:
             DataFrame with OHLCV data
-            
+
         Raises:
             DataPipelineError: If data retrieval fails
         """
-        # Check cache
-        cached = self._get_from_cache(symbol)
+        # -----------------
+        # Cache path
+        # -----------------
+        cached = self._get_from_cache(symbol, timeframe)
         if cached is not None:
-            self.logger.debug(f"Cache hit: {symbol}")
-            return cached.tail(lookback_bars)
-        
-        # Fetch from provider
+            self.logger.debug(f"Cache hit: {symbol} {timeframe}")
+
+            # Prevent lookahead on cached path too
+            cached = self._drop_incomplete_last_bar(cached, timeframe)
+
+            if cached is not None and not cached.empty:
+                return cached.tail(lookback_bars)
+
+        # -----------------
+        # Provider path
+        # -----------------
         try:
-            bars_df = self._fetch_from_alpaca(symbol, lookback_bars, timeframe)
-            
-            # Validate staleness
-            if not bars_df.empty:
-                latest_ts = bars_df.index[-1]
-                age = datetime.now(latest_ts.tzinfo) - latest_ts
-                
+            # Fetch a bit extra so dropping the last bar doesn't leave us short
+            fetch_n = max(int(lookback_bars) + 2, 3)
+
+            bars_df = self._fetch_from_alpaca(symbol, fetch_n, timeframe)
+
+            # Prevent lookahead: drop incomplete last bar
+            bars_df = self._drop_incomplete_last_bar(bars_df, timeframe)
+
+            # Validate staleness (use last timestamp in UTC)
+            if bars_df is not None and not bars_df.empty:
+                latest_ts = pd.Timestamp(bars_df.index[-1])
+
+                if latest_ts.tzinfo is None:
+                    latest_ts = latest_ts.tz_localize("UTC")
+                else:
+                    latest_ts = latest_ts.tz_convert("UTC")
+
+                age = datetime.now(timezone.utc) - latest_ts.to_pydatetime()
+
                 if age > self.max_staleness:
                     self.logger.warning(
                         f"Data stale for {symbol}",
                         extra={
                             "symbol": symbol,
                             "age_seconds": age.total_seconds(),
-                            "max_staleness": self.max_staleness.total_seconds()
-                        }
+                            "max_staleness": self.max_staleness.total_seconds(),
+                            "timeframe": timeframe,
+                        },
                     )
-                    raise DataStalenessError(f"Data stale: {age.total_seconds()}s > {self.max_staleness.total_seconds()}s")
-            
-            # Cache result
-            self._put_in_cache(symbol, bars_df)
-            
-            return bars_df.tail(lookback_bars)
-            
+                    raise DataStalenessError(
+                        f"Data stale: {age.total_seconds()}s > {self.max_staleness.total_seconds()}s"
+                    )
+
+            # Cache result (cache full df; caller tails it)
+            self._put_in_cache(symbol, timeframe, bars_df)
+
+            return bars_df.tail(lookback_bars) if bars_df is not None else bars_df
+
         except Exception as e:
             self.logger.error(
                 f"Failed to get bars for {symbol}",
-                extra={"symbol": symbol, "error": str(e)},
-                exc_info=True
+                extra={"symbol": symbol, "error": str(e), "timeframe": timeframe},
+                exc_info=True,
             )
             raise DataPipelineError(f"Failed to get bars: {e}")
-    
+
     def get_current_price(self, symbol: str) -> Decimal:
         """Get current price for symbol."""
         bars = self.get_latest_bars(symbol, lookback_bars=1)
@@ -287,33 +311,155 @@ class MarketDataPipeline:
         }
         return mapping.get(timeframe, TimeFrame(1, TimeFrameUnit.Minute))
     
-    def _get_from_cache(self, symbol: str) -> Optional[pd.DataFrame]:
-        """Get from cache if not stale."""
+    def _get_from_cache(self, symbol: object, timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
+        """Get cached bars for (symbol, timeframe) if not expired.
+
+        Canonical call style:
+            cached = self._get_from_cache(symbol, timeframe)
+
+        Backward-compat:
+            _get_from_cache((symbol, timeframe)) or _get_from_cache("SYMB:1Min")
+        """
+        # Backward-compat: allow callers to pass a pre-built key
+        if timeframe is None and isinstance(symbol, tuple) and len(symbol) == 2:
+            symbol, timeframe = symbol
+        if timeframe is None and isinstance(symbol, str) and ":" in symbol:
+            symbol, timeframe = symbol.split(":", 1)
+
+        cache_key = (str(symbol), str(timeframe))
+
         with self._cache_lock:
-            if symbol in self._cache:
-                df, cached_at = self._cache[symbol]
-                age = datetime.now() - cached_at
-                
-                if age < self.cache_ttl:
-                    return df
-                else:
-                    # Expired
-                    del self._cache[symbol]
-        
-        return None
-    
-    def _put_in_cache(self, symbol: str, df: pd.DataFrame):
-        """Put in cache."""
+            item = self._cache.get(cache_key)
+            if item is None:
+                return None
+
+            df, cached_at = item
+            now = datetime.now(timezone.utc)
+            if cached_at.tzinfo is None:
+                cached_at = cached_at.replace(tzinfo=timezone.utc)
+            age = now - cached_at
+
+            if age < self.cache_ttl:
+                return df
+
+            del self._cache[cache_key]
+            return None
+
+
+    def _put_in_cache(self, symbol: object, timeframe: Optional[str], df: Optional[pd.DataFrame] = None) -> None:
+        """Put bars into cache under (symbol, timeframe).
+
+        Canonical call style:
+            self._put_in_cache(symbol, timeframe, bars_df)
+
+        Backward-compat:
+            _put_in_cache((symbol, timeframe), df) or _put_in_cache("SYMB:1Min", df)
+        """
+        # Backward-compat: allow callers to pass (cache_key, df)
+        if df is None and isinstance(timeframe, pd.DataFrame):
+            df = timeframe
+            timeframe = None
+
+        if isinstance(symbol, tuple) and len(symbol) == 2:
+            symbol, timeframe = symbol
+        if timeframe is None and isinstance(symbol, str) and ":" in symbol:
+            symbol, timeframe = symbol.split(":", 1)
+
+        if df is None:
+            raise TypeError("_put_in_cache expected a DataFrame, got None")
+
+        cache_key = (str(symbol), str(timeframe))
         with self._cache_lock:
-            self._cache[symbol] = (df, datetime.now())
-    
-    def clear_cache(self):
-        """Clear all cached data."""
+            self._cache[cache_key] = (df, datetime.now(timezone.utc))
+
+
+    def clear_cache(self) -> None:
+        """Clear all cached market data."""
         with self._cache_lock:
             self._cache.clear()
         self.logger.info("Cache cleared")
 
+    def _timeframe_to_timedelta(self, timeframe: str) -> timedelta:
+        tf = (timeframe or "").strip().lower()
 
+        # Common formats: "1Min", "5Min", "1Hour", "1Day"
+        if tf.endswith("min"):
+            n = int(tf[:-3] or "1")
+            return timedelta(minutes=n)
+        if tf.endswith("hour"):
+            n = int(tf[:-4] or "1")
+            return timedelta(hours=n)
+        if tf.endswith("day"):
+            n = int(tf[:-3] or "1")
+            return timedelta(days=n)
+
+        # Also accept "1m", "5m", "1h", "1d"
+        if tf.endswith("m"):
+            return timedelta(minutes=int(tf[:-1] or "1"))
+        if tf.endswith("h"):
+            return timedelta(hours=int(tf[:-1] or "1"))
+        if tf.endswith("d"):
+            return timedelta(days=int(tf[:-1] or "1"))
+
+        # Default safe behavior
+        return timedelta(minutes=1)
+
+    def _drop_incomplete_last_bar(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        """
+        Drop the last bar if it is not complete yet (anti-lookahead).
+        Completeness rule: now >= last_ts + timeframe_duration
+        """
+        if df is None or df.empty:
+            return df
+
+        # Ensure a DatetimeIndex
+        if not isinstance(df.index, pd.DatetimeIndex):
+            return df
+
+        last_ts = df.index[-1]
+
+        # Normalize timezone: compare now in the same tz as last_ts
+        if last_ts.tzinfo is None:
+            now = datetime.utcnow().replace(tzinfo=timezone.utc)
+            last_ts = last_ts.tz_localize(timezone.utc)
+            # (optional) also localize whole index if you want consistency:
+            # df = df.tz_localize(timezone.utc)
+        else:
+            now = datetime.now(tz=last_ts.tzinfo)
+
+        dur = self._timeframe_to_timedelta(timeframe)
+
+        # If the bar hasn't had time to "finish", drop it
+        if now < (last_ts.to_pydatetime() + dur):
+            self.logger.warning(
+                "Dropping incomplete last bar (anti-lookahead)",
+                extra={
+                    "timeframe": timeframe,
+                    "last_ts": str(last_ts),
+                    "now": now.isoformat(),
+                    "seconds_remaining": (last_ts.to_pydatetime() + dur - now).total_seconds(),
+                },
+            )
+            return df.iloc[:-1]
+
+        return df
+
+    def _ensure_utc_index(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Make sure df.index is a tz-aware DatetimeIndex in UTC."""
+        if df is None or df.empty:
+            return df
+        if not isinstance(df.index, pd.DatetimeIndex):
+            # If your fetch returns a timestamp column instead of index, handle it here if needed.
+            # Otherwise leave it and let downstream fail loudly.
+            return df
+
+        if df.index.tz is None:
+            df = df.copy()
+            df.index = df.index.tz_localize(timezone.utc)
+        else:
+            df = df.tz_convert(timezone.utc)
+        return df
+    
 # ============================================================================
 # EXCEPTIONS
 # ============================================================================
