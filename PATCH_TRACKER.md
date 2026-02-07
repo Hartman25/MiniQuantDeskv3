@@ -177,7 +177,38 @@
   - ✅ Metadata (symbol, strategy, broker_order_id) survives round-trip
 
 ## PATCH 7: Periodic reconciliation, not just startup
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `PeriodicReconciler` class that wraps `StartupReconciler`
+  with time-gated `check()` method.  The runtime loop can call `check()` every
+  cycle; reconciliation only actually queries the broker when the configured
+  interval has elapsed.  Returns `ReconciliationResult` with discrepancies.
+  Thread-safe.  Errors produce synthetic discrepancy records rather than crashing.
+- **Files changed:**
+  - `core/state/reconciler.py` — added `PeriodicReconciler`, `ReconciliationResult`
+  - `tests/p1/test_patch7_periodic_reconciliation.py` (NEW — 12 tests)
+- **Tests added:**
+  - `test_first_call_always_runs` — first check always executes
+  - `test_second_call_within_interval_skipped` — gated by interval
+  - `test_second_call_after_interval_runs` — runs after interval elapses
+  - `test_discrepancies_passed_through` — inner discrepancies forwarded
+  - `test_no_discrepancies_empty_list` — clean state
+  - `test_reconciler_error_yields_synthetic_discrepancy` — error handling
+  - `test_run_count_increments_only_on_actual_runs` — counter accuracy
+  - `test_custom_interval_respected` — configurable interval
+  - `test_result_has_timestamp` — result metadata
+  - `test_thread_safety_no_duplicate_runs` — concurrent call safety
+  - `test_interval_property` — property accessor
+  - `test_skipped_result_has_empty_discrepancies` — skipped state
+- **Commands run + results:**
+  - `python -m py_compile core/state/reconciler.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch7_periodic_reconciliation.py -v` → 12 passed
+- **Done definition:**
+  - ✅ PeriodicReconciler gates on elapsed time, doesn't over-query broker
+  - ✅ Discrepancies reported via ReconciliationResult
+  - ✅ Thread-safe concurrent calls
+  - ✅ Errors don't crash, produce synthetic discrepancy records
 
 ## PATCH 8: Fail-closed on data staleness with explicit journal record
 - **Status:** TODO
