@@ -78,4 +78,56 @@ Each component can be validated independently.
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+2️⃣ Paper smoke test (safe)
+python entry_paper.py --once
+Expected behavior:
 
+One cycle
+
+Heartbeat printed
+
+Market-closed is acceptable
+
+Exit code 0
+
+3️⃣ Live smoke test (safe refusal)
+python entry_live.py --once --i-know-what-im-doing
+Expected behavior:
+
+PAPER keys → refusal
+
+Clear error message
+
+Non-zero exit code
+
+No orders placed
+
+4️⃣ Environment check
+python entry_paper.py --env-check
+python entry_live.py --env-check
+Project Status
+✅ Smoke track complete
+
+✅ Paper trading validated for correctness
+
+🚧 Strategy validation ongoing
+
+🚧 Live trading intentionally restricted
+
+This repository is under active development. Stability and correctness take priority over new features.
+
+Roadmap (High Level)
+Phase 1: Runtime correctness & paper validation
+
+Phase 2: Advanced risk controls & monitoring
+
+Phase 3: Multi-account orchestration
+
+Phase 4: AI/ML signal modules (optional, isolated)
+
+No phase compromises the safety guarantees of earlier phases.
+
+Disclaimer
+This software is for research and educational purposes.
+Trading financial instruments involves risk.
+You are responsible for understanding and complying with all applicable laws and broker terms.
