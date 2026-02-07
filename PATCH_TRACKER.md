@@ -380,7 +380,41 @@
   - ✅ All session queries accept UTC and convert internally
 
 ## PATCH 13: Make backtest and live share same execution interface
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `ExecutionProtocol` (runtime_checkable Protocol per PEP 544)
+  and `NullExecution` (no-op backend) to `core/execution/protocol.py`.  Any
+  execution backend (live, paper, backtest) must satisfy the same structural
+  interface.  `NullExecution` auto-fills market orders and tracks order state
+  for testing without a real broker.
+- **Files changed:**
+  - `core/execution/protocol.py` (NEW)
+  - `tests/p1/test_patch13_execution_protocol.py` (NEW — 15 tests)
+- **Tests added:**
+  - `test_null_execution_satisfies_protocol` — isinstance check
+  - `test_submit_market_order_returns_str` — broker_order_id is str
+  - `test_submit_limit_order_returns_str` — broker_order_id is str
+  - `test_submit_stop_order_returns_str` — broker_order_id is str
+  - `test_cancel_existing_returns_true` — cancel existing order
+  - `test_cancel_unknown_returns_false` — cancel unknown is False
+  - `test_get_order_status` — status query
+  - `test_get_fill_details_market` — fill qty/price for market
+  - `test_get_fill_details_unknown` — (None, None) for unknown
+  - `test_market_order_auto_fills` — market → FILLED immediately
+  - `test_limit_order_starts_submitted` — limit → SUBMITTED
+  - `test_cancel_changes_status` — cancel → CANCELLED
+  - `test_protocol_is_runtime_checkable` — Protocol attribute check
+  - `test_non_compliant_object_fails` — plain object fails isinstance
+  - `test_unique_broker_ids` — 10 orders get 10 unique IDs
+- **Commands run + results:**
+  - `python -m py_compile core/execution/protocol.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch13_execution_protocol.py -v` → 15 passed
+- **Done definition:**
+  - ✅ Single Protocol defines all execution methods
+  - ✅ NullExecution satisfies Protocol (isinstance passes)
+  - ✅ Non-compliant objects fail isinstance
+  - ✅ Market orders auto-fill, limits start SUBMITTED
 
 ## PATCH 14: Add deterministic research runner
 - **Status:** TODO
