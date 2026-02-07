@@ -46,6 +46,91 @@ SignalLike = Union[Dict, "StrategySignal"] if StrategySignal else Dict
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# PATCH 5: Purity enforcement — signal output validation
+# ---------------------------------------------------------------------------
+
+# Names of modules / class prefixes that indicate broker-level objects.
+# If a strategy stores any of these as attributes, purity is violated.
+_BROKER_ATTR_NAMES = frozenset({
+    "broker", "_broker", "broker_connector", "_broker_connector",
+    "execution_engine", "_execution_engine", "exec_engine", "_exec_engine",
+})
+
+
+class StrategyPurityError(TypeError):
+    """Raised when a strategy violates the purity contract.
+
+    Purity means:
+      - on_bar() returns None, a dict, a StrategySignal, or a list thereof
+      - the strategy does NOT hold a direct broker reference
+    """
+
+
+def validate_signal_output(result, *, strategy_name: str = "UNKNOWN") -> List[Dict]:
+    """
+    Validate and normalize the return value of ``on_bar()``.
+
+    Accepted inputs:
+      - ``None``  →  ``[]``
+      - ``dict``  →  ``[dict]``
+      - ``StrategySignal``  →  ``[signal.to_dict()]``
+      - ``list[dict | StrategySignal]``  →  normalized list
+
+    Anything else raises ``StrategyPurityError``.
+    """
+    if result is None:
+        return []
+
+    # Single typed signal
+    if StrategySignal is not None and isinstance(result, StrategySignal):
+        return [result.to_dict()]
+
+    # Single dict
+    if isinstance(result, dict):
+        return [result]
+
+    # List of signals
+    if isinstance(result, (list, tuple)):
+        out: List[Dict] = []
+        for i, item in enumerate(result):
+            if isinstance(item, dict):
+                out.append(item)
+            elif StrategySignal is not None and isinstance(item, StrategySignal):
+                out.append(item.to_dict())
+            else:
+                raise StrategyPurityError(
+                    f"Strategy '{strategy_name}' on_bar() returned a list "
+                    f"containing invalid type at index {i}: {type(item).__name__}. "
+                    f"Expected dict or StrategySignal."
+                )
+        return out
+
+    raise StrategyPurityError(
+        f"Strategy '{strategy_name}' on_bar() returned unsupported type: "
+        f"{type(result).__name__}. "
+        f"Must return None, dict, StrategySignal, or list thereof."
+    )
+
+
+def check_broker_access(strategy: "IStrategy") -> None:
+    """
+    Verify that a strategy does NOT hold a direct broker reference.
+
+    Raises ``StrategyPurityError`` if a broker-like attribute is found.
+    Called during ``start_strategy()`` so problems surface at init time,
+    not in the middle of a live trading loop.
+    """
+    for attr_name in _BROKER_ATTR_NAMES:
+        val = getattr(strategy, attr_name, None)
+        if val is not None:
+            raise StrategyPurityError(
+                f"Strategy '{strategy.name}' has attribute '{attr_name}' "
+                f"(type={type(val).__name__}). Strategies must NOT hold "
+                f"direct broker/engine references — they return signal "
+                f"intents only."
+            )
+
 
 class IStrategy(ABC):
     """

@@ -121,6 +121,7 @@
   - ✅ 100% of existing tests still pass (120/120)
 
 ## PATCH 5: Make strategy decision purity enforceable
+<<<<<<< HEAD
 - **Status:** TODO
 
 ## PATCH 6: Persist and restore pending orders into the order state machine
@@ -152,3 +153,378 @@
 
 ## PATCH 15: Enforce config discipline with schema validation
 - **Status:** TODO
+=======
+- **Status:** DONE
+- **Summary:** Added `validate_signal_output()` and `check_broker_access()`
+  to `strategies/base.py`. The lifecycle manager now calls
+  `validate_signal_output()` on every `on_bar()` return and
+  `check_broker_access()` on `start_strategy()`. A strategy that returns
+  a bad type raises `StrategyPurityError` immediately. A strategy holding
+  a broker/engine reference is caught at startup.
+- **Files changed:**
+  - `strategies/base.py` — added `StrategyPurityError`, `validate_signal_output()`,
+    `check_broker_access()`, `_BROKER_ATTR_NAMES`
+  - `strategies/lifecycle.py` — `start_strategy()` calls `check_broker_access()`;
+    `on_bar()` calls `validate_signal_output()` and re-raises `StrategyPurityError`
+  - `tests/p1/test_patch5_strategy_purity.py` (NEW — 19 tests)
+- **Tests added:** 19 tests covering validation, broker detection, lifecycle integration
+- **Commands run + results:**
+  - `python -m py_compile strategies/base.py` → OK
+  - `python -m py_compile strategies/lifecycle.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch5_strategy_purity.py -v` → 19 passed
+- **Done definition:**
+  - ✅ Base class enforces on_bar returns list of signal dicts (or empty)
+  - ✅ Strategy cannot hold broker reference — caught at start time
+  - ✅ Bad strategy raises StrategyPurityError immediately
+
+## PATCH 6: Persist and restore pending orders into the order state machine
+- **Status:** DONE
+- **Summary:** Added `restore_pending_orders()` method to `OrderStateMachine` that
+  replays the transaction log, tracks the latest state per order_id, and restores
+  any non-terminal orders (SUBMITTED, PARTIALLY_FILLED) back into memory.
+  Also added ORDER_CREATED event logging in `create_order()` so metadata
+  (symbol, strategy, quantity, side, order_type) survives crash/restart.
+- **Files changed:**
+  - `core/state/order_machine.py` — added `restore_pending_orders()` method;
+    `create_order()` now logs ORDER_CREATED event to transaction log
+  - `tests/p1/test_patch6_pending_order_persistence.py` (NEW — 8 tests)
+- **Tests added:**
+  - `test_submitted_order_restored` — SUBMITTED survives simulated crash
+  - `test_filled_order_not_restored` — FILLED is terminal, not restored
+  - `test_cancelled_order_not_restored` — CANCELLED is terminal, not restored
+  - `test_multiple_orders_mixed` — only non-terminal orders restored
+  - `test_idempotent` — calling restore twice doesn't duplicate
+  - `test_partially_filled_restored` — PARTIALLY_FILLED is non-terminal
+  - `test_empty_log_restores_nothing` — empty log → 0 restored
+  - `test_metadata_survives_roundtrip` — symbol, strategy, broker_order_id survive
+- **Commands run + results:**
+  - `python -m py_compile core/state/order_machine.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch6_pending_order_persistence.py -v` → 8 passed
+- **Done definition:**
+  - ✅ On restart, SUBMITTED/PARTIALLY_FILLED orders restored from transaction log
+  - ✅ Terminal orders (FILLED, CANCELLED, REJECTED, EXPIRED) NOT restored
+  - ✅ Idempotent: calling restore twice doesn't duplicate
+  - ✅ Metadata (symbol, strategy, broker_order_id) survives round-trip
+
+## PATCH 7: Periodic reconciliation, not just startup
+- **Status:** DONE
+- **Summary:** Added `PeriodicReconciler` class that wraps `StartupReconciler`
+  with time-gated `check()` method.  The runtime loop can call `check()` every
+  cycle; reconciliation only actually queries the broker when the configured
+  interval has elapsed.  Returns `ReconciliationResult` with discrepancies.
+  Thread-safe.  Errors produce synthetic discrepancy records rather than crashing.
+- **Files changed:**
+  - `core/state/reconciler.py` — added `PeriodicReconciler`, `ReconciliationResult`
+  - `tests/p1/test_patch7_periodic_reconciliation.py` (NEW — 12 tests)
+- **Tests added:**
+  - `test_first_call_always_runs` — first check always executes
+  - `test_second_call_within_interval_skipped` — gated by interval
+  - `test_second_call_after_interval_runs` — runs after interval elapses
+  - `test_discrepancies_passed_through` — inner discrepancies forwarded
+  - `test_no_discrepancies_empty_list` — clean state
+  - `test_reconciler_error_yields_synthetic_discrepancy` — error handling
+  - `test_run_count_increments_only_on_actual_runs` — counter accuracy
+  - `test_custom_interval_respected` — configurable interval
+  - `test_result_has_timestamp` — result metadata
+  - `test_thread_safety_no_duplicate_runs` — concurrent call safety
+  - `test_interval_property` — property accessor
+  - `test_skipped_result_has_empty_discrepancies` — skipped state
+- **Commands run + results:**
+  - `python -m py_compile core/state/reconciler.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch7_periodic_reconciliation.py -v` → 12 passed
+- **Done definition:**
+  - ✅ PeriodicReconciler gates on elapsed time, doesn't over-query broker
+  - ✅ Discrepancies reported via ReconciliationResult
+  - ✅ Thread-safe concurrent calls
+  - ✅ Errors don't crash, produce synthetic discrepancy records
+
+## PATCH 8: Fail-closed on data staleness with explicit journal record
+- **Status:** DONE
+- **Summary:** Added `StalenessGuard` class and `StalenessVerdict` dataclass to
+  `core/data/validator.py`.  Every bar freshness check produces a journal-ready
+  event dict (auditable trail).  Rejection reasons: `stale` (age > threshold),
+  `incomplete` (bar not closed, anti-lookahead), `no_data` (None bar),
+  `completion_check_error` (fail-closed on exception).
+- **Files changed:**
+  - `core/data/validator.py` — added `StalenessGuard`, `StalenessVerdict`
+  - `tests/p1/test_patch8_staleness_guard.py` (NEW — 14 tests)
+- **Tests added:**
+  - `test_fresh_complete_bar_passes` — fresh + complete passes
+  - `test_stale_bar_rejected` — age > threshold rejected
+  - `test_incomplete_bar_rejected` — not closed rejected
+  - `test_no_bar_rejected` — None bar rejected
+  - `test_custom_threshold_respected` — configurable threshold
+  - `test_event_has_required_keys` — journal event shape
+  - `test_passed_event_has_bar_age` — bar_age_s in passed event
+  - `test_rejected_stale_has_bar_timestamp` — bar_timestamp in stale event
+  - `test_require_complete_false_skips_check` — opt-out completion check
+  - `test_symbol_fallback_when_bar_none` — symbol from param
+  - `test_verdict_is_frozen` — immutable verdict
+  - `test_completion_error_fails_closed` — exception causes rejection
+  - `test_no_data_event_has_none_age` — None age for no_data
+  - `test_threshold_boundary_passes` — exact threshold passes
+- **Commands run + results:**
+  - `python -m py_compile core/data/validator.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch8_staleness_guard.py -v` → 14 passed
+- **Done definition:**
+  - ✅ Every staleness decision produces journal-ready event
+  - ✅ Fail-closed: stale, incomplete, missing bars all rejected
+  - ✅ Auditable trail for both pass and reject outcomes
+
+## PATCH 9: Make protective-stop lifecycle authoritative
+- **Status:** DONE
+- **Summary:** Added `StopLifecycleManager` and `StopLifecycleEvent` to
+  `core/risk/protections/stop_lifecycle.py`.  Centralises the create/cancel/
+  restore lifecycle of protective stop orders with journal-ready events for
+  every transition.  Idempotent: duplicate place returns already_exists,
+  cancel on missing returns not_found.  Supports crash recovery via
+  `restore_from_events()`.  Thread-safe.
+- **Files changed:**
+  - `core/risk/protections/stop_lifecycle.py` (NEW)
+  - `tests/p1/test_patch9_stop_lifecycle.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_place_stores_stop` — place creates entry
+  - `test_cancel_removes_stop` — cancel removes entry
+  - `test_get_stop_id_returns_id` — query returns correct ID
+  - `test_get_stop_id_returns_none` — query returns None
+  - `test_has_stop` — boolean check
+  - `test_active_stops_snapshot` — full snapshot
+  - `test_idempotent_place` — duplicate place is no-op
+  - `test_idempotent_cancel` — cancel on missing is no-op
+  - `test_restore_from_events` — replay placed+cancelled correctly
+  - `test_restore_skips_already_active` — doesn't overwrite existing
+  - `test_event_to_dict_has_required_keys` — event shape
+  - `test_count_property` — active count
+  - `test_history_records_all_events` — full audit trail
+  - `test_thread_safety` — concurrent place/cancel
+  - `test_cancel_after_cancel` — double cancel
+  - `test_place_with_stop_price` — stop_price in event
+- **Commands run + results:**
+  - `python -m py_compile core/risk/protections/stop_lifecycle.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch9_stop_lifecycle.py -v` → 16 passed
+- **Done definition:**
+  - ✅ Single source of truth for active protective stops
+  - ✅ Every lifecycle transition produces journal-ready event
+  - ✅ Crash recovery via restore_from_events()
+  - ✅ Idempotent place/cancel (no-op on duplicate)
+
+## PATCH 10: Remove repo landmines
+- **Status:** DONE
+- **Summary:** Removed backup files (.bak/.backup), deprecated protections_old/
+  directory (14 files), and replaced all hardcoded absolute user paths with
+  relative paths.  Added 8 guardrail tests that prevent these landmines from
+  returning.
+- **Files changed:**
+  - DELETED: `legacy/brokers/alpaca_connector_ORIGINAL.py.backup`
+  - DELETED: `legacy/core/app_ORIGINAL.py.backup`
+  - DELETED: `legacy/core/reconciler_ORIGINAL.py.backup`
+  - DELETED: `legacy/tests/conftest.py.bak`
+  - DELETED: `legacy/tests/test_01_entry_places_protective_stop.py.bak`
+  - DELETED: `core/risk/protections_old/` (14 files)
+  - `tools/VERIFY_PROTECTION_MIGRATION.py` — fixed hardcoded path + import
+  - `tools/check_inventory.py` — fixed hardcoded path
+  - `tools/fix_events.py` — fixed hardcoded paths
+  - `tests/test_integration_simple.py` — fixed hardcoded sys.path
+  - `tests/p1/test_patch10_repo_landmines.py` (NEW — 8 guardrail tests)
+- **Tests added:**
+  - `test_no_backup_files_tracked` — no .bak/.backup/.orig in git
+  - `test_no_deprecated_protections_old` — directory removed
+  - `test_no_hardcoded_user_paths` — no C:/Users/... in .py files
+  - `test_no_hardcoded_api_keys` — no real keys in .py files
+  - `test_no_pdb_in_production_code` — no debug breakpoints
+  - `test_gitignore_covers_essentials` — .gitignore has required patterns
+  - `test_config_uses_placeholders` — config.yaml uses placeholders only
+  - `test_no_import_from_protections_old` — no imports from dead code
+- **Commands run + results:**
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch10_repo_landmines.py -v` → 8 passed
+- **Done definition:**
+  - ✅ All backup files removed from git
+  - ✅ Deprecated protections_old/ directory deleted
+  - ✅ All hardcoded user paths replaced with relative paths
+  - ✅ Guardrail tests prevent regression
+
+## PATCH 11: Guarantee single-trade-at-a-time enforced in engine
+- **Status:** DONE
+- **Summary:** Added `SingleTradeGuard` class with atomic check-and-reserve
+  mechanism.  At most one entry order per symbol can be in-flight.  Closes
+  the race window between coordinator's pure check and broker submission.
+  Thread-safe, every decision journal-logged.
+- **Files changed:**
+  - `core/execution/single_trade_guard.py` (NEW)
+  - `tests/p1/test_patch11_single_trade_guard.py` (NEW — 15 tests)
+- **Tests added:**
+  - `test_reserve_succeeds_on_empty` — first reserve works
+  - `test_reserve_blocked_when_taken` — duplicate blocked
+  - `test_release_frees_symbol` — release allows re-reserve
+  - `test_release_idempotent` — release on empty is noop
+  - `test_different_symbols_concurrent` — independent symbols OK
+  - `test_is_reserved_and_get_reservation` — query methods
+  - `test_reserved_symbols_snapshot` — full snapshot
+  - `test_count_property` — active count
+  - `test_event_to_dict` — event shape
+  - `test_history_records_all` — audit trail
+  - `test_thread_safety_only_one_wins` — 10 threads, 1 wins
+  - `test_restore_reservations` — startup restore
+  - `test_restore_skips_existing` — no overwrite
+  - `test_clear_all` — bulk clear
+  - `test_blocked_event_carries_blocking_id` — blocked reason
+- **Commands run + results:**
+  - `python -m py_compile core/execution/single_trade_guard.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch11_single_trade_guard.py -v` → 15 passed
+- **Done definition:**
+  - ✅ Atomic check-and-reserve at engine level
+  - ✅ Only one entry per symbol in-flight
+  - ✅ Thread-safe (10-thread contention test)
+  - ✅ Journal-ready events for every decision
+
+## PATCH 12: Normalize time and session boundaries
+- **Status:** DONE
+- **Summary:** Added `utc_now()`, `ensure_utc()`, `epoch_ms()` helpers and
+  `MarketSession`/`SessionBoundary` classes to `core/time/clock.py`.
+  Provides canonical UTC time access, naive→aware normalization, and
+  structured session boundary queries (pre-market, regular, after-hours).
+- **Files changed:**
+  - `core/time/clock.py` — added time helpers + MarketSession
+  - `tests/p1/test_patch12_time_normalization.py` (NEW — 19 tests)
+- **Tests added:** 19 tests covering utc_now, ensure_utc, epoch_ms,
+  SessionBoundary.contains, MarketSession (regular/pre/after/weekend/outside)
+- **Commands run + results:**
+  - `python -m py_compile core/time/clock.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch12_time_normalization.py -v` → 19 passed
+- **Done definition:**
+  - ✅ Canonical `utc_now()` helper
+  - ✅ `ensure_utc()` normalizes naive datetimes
+  - ✅ MarketSession defines pre-market/regular/after-hours boundaries
+  - ✅ All session queries accept UTC and convert internally
+
+## PATCH 13: Make backtest and live share same execution interface
+- **Status:** DONE
+- **Summary:** Added `ExecutionProtocol` (runtime_checkable Protocol per PEP 544)
+  and `NullExecution` (no-op backend) to `core/execution/protocol.py`.  Any
+  execution backend (live, paper, backtest) must satisfy the same structural
+  interface.  `NullExecution` auto-fills market orders and tracks order state
+  for testing without a real broker.
+- **Files changed:**
+  - `core/execution/protocol.py` (NEW)
+  - `tests/p1/test_patch13_execution_protocol.py` (NEW — 15 tests)
+- **Tests added:**
+  - `test_null_execution_satisfies_protocol` — isinstance check
+  - `test_submit_market_order_returns_str` — broker_order_id is str
+  - `test_submit_limit_order_returns_str` — broker_order_id is str
+  - `test_submit_stop_order_returns_str` — broker_order_id is str
+  - `test_cancel_existing_returns_true` — cancel existing order
+  - `test_cancel_unknown_returns_false` — cancel unknown is False
+  - `test_get_order_status` — status query
+  - `test_get_fill_details_market` — fill qty/price for market
+  - `test_get_fill_details_unknown` — (None, None) for unknown
+  - `test_market_order_auto_fills` — market → FILLED immediately
+  - `test_limit_order_starts_submitted` — limit → SUBMITTED
+  - `test_cancel_changes_status` — cancel → CANCELLED
+  - `test_protocol_is_runtime_checkable` — Protocol attribute check
+  - `test_non_compliant_object_fails` — plain object fails isinstance
+  - `test_unique_broker_ids` — 10 orders get 10 unique IDs
+- **Commands run + results:**
+  - `python -m py_compile core/execution/protocol.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch13_execution_protocol.py -v` → 15 passed
+- **Done definition:**
+  - ✅ Single Protocol defines all execution methods
+  - ✅ NullExecution satisfies Protocol (isinstance passes)
+  - ✅ Non-compliant objects fail isinstance
+  - ✅ Market orders auto-fill, limits start SUBMITTED
+
+## PATCH 14: Add deterministic research runner
+- **Status:** DONE
+- **Summary:** Added `ResearchRunner` class to `core/research/runner.py` that
+  provides a sealed, reproducible environment for strategy research.  Uses
+  `BacktestClock` for deterministic time, seeded RNG for reproducible randomness,
+  and configurable fill-price source.  Every decision is logged in a journal-
+  ready event list.  `finalize()` seals the run and produces a `ResearchReport`.
+  `reset()` creates a fresh runner with the same config for re-run comparison.
+- **Files changed:**
+  - `core/research/__init__.py` (NEW)
+  - `core/research/runner.py` (NEW)
+  - `tests/p1/test_patch14_research_runner.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_empty_run_zero_bars` — empty run produces zero-bar report
+  - `test_no_strategy_no_signal` — NO_SIGNAL without strategy
+  - `test_strategy_submit_market` — SUBMIT_MARKET with strategy
+  - `test_fill_uses_close_price` — default fill from close
+  - `test_fill_uses_open_price` — configurable fill from open
+  - `test_deterministic_same_seed` — same seed → identical results
+  - `test_different_seed_different_ids` — different seeds → different IDs
+  - `test_finalize_prevents_add_bar` — sealed after finalize
+  - `test_double_finalize_raises` — double finalize raises
+  - `test_journal_has_start_and_end` — journal bookends
+  - `test_report_to_dict_serializable` — JSON-serializable report
+  - `test_config_hash_deterministic` — same params → same hash
+  - `test_reset_creates_fresh_runner` — reset for re-run
+  - `test_clock_advances_per_bar` — clock advances correctly
+  - `test_skip_when_qty_zero` — zero qty → SKIP
+  - `test_rng_seeded_and_reproducible` — seeded RNG
+- **Commands run + results:**
+  - `python -m py_compile core/research/runner.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch14_research_runner.py -v` → 16 passed
+- **Done definition:**
+  - ✅ Same seed + bars + strategy → identical results
+  - ✅ No I/O, no real broker
+  - ✅ Every decision journal-logged
+  - ✅ Reproducible RNG via explicit seed
+
+## PATCH 15: Enforce config discipline with schema validation
+- **Status:** DONE
+- **Summary:** Added `core/config/validator.py` with structured config validation
+  layer.  `validate_config()` returns all errors at once (not just the first) as
+  `ConfigError` objects with path, message, and error_type.  Strict mode rejects
+  unknown keys at top level, within sections, and within strategy configs.
+  `FrozenConfig` wraps a validated dict and blocks post-load mutation.
+  `config_hash()` detects drift between load and use.
+- **Files changed:**
+  - `core/config/validator.py` (NEW)
+  - `tests/p1/test_patch15_config_discipline.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_valid_config_ok` — valid config passes
+  - `test_missing_required_section` — missing broker → error
+  - `test_invalid_type` — string where int expected → error
+  - `test_value_out_of_range` — below minimum → value_error
+  - `test_extra_top_level_key_strict` — unknown top key rejected
+  - `test_extra_section_key_strict` — unknown section key rejected
+  - `test_extra_strategy_key` — unknown strategy key rejected
+  - `test_non_strict_ignores_extras` — non-strict is lenient
+  - `test_multiple_errors_collected` — all errors at once
+  - `test_summary_human_readable` — summary() formatting
+  - `test_config_error_str` — ConfigError.__str__
+  - `test_config_hash_deterministic` — same data → same hash
+  - `test_config_hash_differs` — different data → different hash
+  - `test_frozen_config_immutable` — setattr blocked
+  - `test_frozen_config_get` — dotted path navigation
+  - `test_frozen_config_integrity` — integrity check passes
+- **Commands run + results:**
+  - `python -m py_compile core/config/validator.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch15_config_discipline.py -v` → 16 passed
+- **Done definition:**
+  - ✅ validate_config() returns all errors at once (not just first)
+  - ✅ Strict mode rejects unknown keys
+  - ✅ FrozenConfig prevents post-load mutation
+  - ✅ config_hash detects drift
+>>>>>>> p1-patch-15pack

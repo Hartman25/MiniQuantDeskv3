@@ -88,6 +88,111 @@ class StartupReconciler:
 
         return discrepancies
 
+
+# ============================================================================
+# PATCH 7: Periodic Reconciliation
+# ============================================================================
+
+@dataclass(frozen=True)
+class ReconciliationResult:
+    """Result of a single periodic reconciliation run."""
+    ran: bool
+    discrepancies: List[Discrepancy]
+    timestamp: datetime
+    skipped_reason: Optional[str] = None
+
+
+class PeriodicReconciler:
+    """
+    Wraps a StartupReconciler (or compatible) to run reconciliation on a
+    configurable interval.  The caller invokes ``check()`` every loop cycle;
+    the reconciler internally gates on elapsed time so it only actually
+    queries the broker every ``interval_s`` seconds.
+
+    Thread-safe: ``check()`` acquires an internal lock.
+
+    Usage in the runtime loop::
+
+        periodic = PeriodicReconciler(reconciler, interval_s=300)
+        ...
+        while running:
+            result = periodic.check()
+            if result.ran and result.discrepancies:
+                # handle drift
+    """
+
+    def __init__(
+        self,
+        reconciler: StartupReconciler,
+        *,
+        interval_s: float = 300.0,
+        clock: Optional[Any] = None,
+    ) -> None:
+        self._reconciler = reconciler
+        self._interval_s = interval_s
+        self._clock = clock  # Optional injectable clock (for tests)
+        self._last_run: Optional[float] = None
+        self._run_count: int = 0
+        self._lock = __import__("threading").Lock()
+
+    # -------------------------
+    # Public API
+    # -------------------------
+    def check(self) -> ReconciliationResult:
+        """
+        Run reconciliation if enough time has elapsed since the last run.
+
+        Returns a ``ReconciliationResult`` indicating whether the check
+        actually ran and what (if any) discrepancies were found.
+        """
+        import time as _time
+
+        now_ts = self._clock.now().timestamp() if self._clock else _time.time()
+
+        with self._lock:
+            if self._last_run is not None:
+                elapsed = now_ts - self._last_run
+                if elapsed < self._interval_s:
+                    return ReconciliationResult(
+                        ran=False,
+                        discrepancies=[],
+                        timestamp=_utc_now(),
+                        skipped_reason=f"interval_not_elapsed ({elapsed:.1f}s / {self._interval_s:.1f}s)",
+                    )
+
+            # Run the actual reconciliation
+            try:
+                discrepancies = self._reconciler.reconcile_startup()
+            except Exception as exc:
+                # Treat reconciliation failure as a discrepancy itself
+                discrepancies = [
+                    Discrepancy(
+                        type="reconciliation_error",
+                        symbol="*",
+                        local_value=None,
+                        broker_value=str(exc),
+                        resolution="error",
+                        timestamp=_utc_now(),
+                    )
+                ]
+
+            self._last_run = now_ts
+            self._run_count += 1
+
+            return ReconciliationResult(
+                ran=True,
+                discrepancies=discrepancies,
+                timestamp=_utc_now(),
+            )
+
+    @property
+    def run_count(self) -> int:
+        return self._run_count
+
+    @property
+    def interval_s(self) -> float:
+        return self._interval_s
+
     # -------------------------
     # Positions
     # -------------------------

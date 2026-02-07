@@ -315,3 +315,165 @@ def validate_staleness(max_age_seconds: int):
 class DataValidationError(Exception):
     """Raised when data validation fails."""
     pass
+
+
+# ============================================================================
+# PATCH 8: STALENESS GUARD (fail-closed with journal record)
+# ============================================================================
+
+from dataclasses import dataclass
+from typing import Dict, Any
+
+
+@dataclass(frozen=True)
+class StalenessVerdict:
+    """
+    Result of a staleness check on a single bar.
+
+    Attributes:
+        ok:       True if the bar passed all freshness checks.
+        reason:   Human-readable rejection reason (None when ok=True).
+        event:    Journal-ready event dict.  Always populated, even on
+                  success, so callers can unconditionally log if desired.
+    """
+    ok: bool
+    reason: Optional[str]
+    event: Dict[str, Any]
+
+
+class StalenessGuard:
+    """
+    Fail-closed staleness gate with explicit journal record.
+
+    Every call to ``check()`` returns a ``StalenessVerdict`` containing
+    a journal-ready event dict.  The runtime loop logs this event
+    regardless of outcome so there is an auditable trail of every
+    staleness decision.
+
+    Modes of rejection:
+      1. **stale** — bar age exceeds ``max_staleness_s``
+      2. **incomplete** — bar has not closed yet (anti-lookahead)
+      3. **no_data** — no bar was available at all
+
+    Usage::
+
+        guard = StalenessGuard(max_staleness_s=65)
+        verdict = guard.check(bar, timeframe="1Min")
+        journal.write_event(verdict.event)
+        if not verdict.ok:
+            continue  # skip trading
+    """
+
+    def __init__(
+        self,
+        max_staleness_s: int = 65,
+        require_complete: bool = True,
+    ) -> None:
+        self.max_staleness_s = max_staleness_s
+        self.require_complete = require_complete
+
+    def check(
+        self,
+        bar: Optional[MarketDataContract],
+        *,
+        timeframe: Optional[str] = None,
+        symbol: Optional[str] = None,
+        reference_time: Optional[datetime] = None,
+    ) -> StalenessVerdict:
+        """
+        Evaluate a bar for freshness.
+
+        Args:
+            bar:            The bar to check (None -> automatic rejection).
+            timeframe:      Expected bar interval (e.g. "1Min").
+            symbol:         Fallback symbol for the journal event when bar is None.
+            reference_time: Override for "now" (useful in tests/backtest).
+
+        Returns:
+            StalenessVerdict with ok/reason/event.
+        """
+        now = reference_time or datetime.now(timezone.utc)
+        sym = (bar.symbol if bar else symbol) or "UNKNOWN"
+
+        # Case 1: no bar at all
+        if bar is None:
+            return StalenessVerdict(
+                ok=False,
+                reason="no_data",
+                event={
+                    "event": "staleness_check",
+                    "symbol": sym,
+                    "outcome": "REJECTED",
+                    "reason": "no_data",
+                    "bar_age_s": None,
+                    "threshold_s": self.max_staleness_s,
+                    "timestamp": now.isoformat(),
+                },
+            )
+
+        age = bar.age_seconds(now)
+
+        # Case 2: bar too old
+        if age > self.max_staleness_s:
+            return StalenessVerdict(
+                ok=False,
+                reason="stale",
+                event={
+                    "event": "staleness_check",
+                    "symbol": sym,
+                    "outcome": "REJECTED",
+                    "reason": "stale",
+                    "bar_age_s": round(age, 1),
+                    "threshold_s": self.max_staleness_s,
+                    "bar_timestamp": bar.timestamp.isoformat(),
+                    "timestamp": now.isoformat(),
+                },
+            )
+
+        # Case 3: bar not yet complete (anti-lookahead)
+        if self.require_complete and timeframe:
+            try:
+                if not bar.is_complete(timeframe, reference_time=now):
+                    return StalenessVerdict(
+                        ok=False,
+                        reason="incomplete",
+                        event={
+                            "event": "staleness_check",
+                            "symbol": sym,
+                            "outcome": "REJECTED",
+                            "reason": "incomplete",
+                            "bar_age_s": round(age, 1),
+                            "timeframe": timeframe,
+                            "bar_timestamp": bar.timestamp.isoformat(),
+                            "timestamp": now.isoformat(),
+                        },
+                    )
+            except Exception:
+                # If is_complete() fails (unknown timeframe, etc.),
+                # fail closed: reject the bar.
+                return StalenessVerdict(
+                    ok=False,
+                    reason="completion_check_error",
+                    event={
+                        "event": "staleness_check",
+                        "symbol": sym,
+                        "outcome": "REJECTED",
+                        "reason": "completion_check_error",
+                        "bar_age_s": round(age, 1),
+                        "timestamp": now.isoformat(),
+                    },
+                )
+
+        # Case 4: bar passes all checks
+        return StalenessVerdict(
+            ok=True,
+            reason=None,
+            event={
+                "event": "staleness_check",
+                "symbol": sym,
+                "outcome": "PASSED",
+                "bar_age_s": round(age, 1),
+                "threshold_s": self.max_staleness_s,
+                "timestamp": now.isoformat(),
+            },
+        )

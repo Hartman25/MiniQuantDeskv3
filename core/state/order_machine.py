@@ -325,11 +325,25 @@ class OrderStateMachine:
             )
             
             self._orders[order_id] = order
-            
+
+            # Log creation to transaction log so restore can recover metadata
+            self.transaction_log.append({
+                "event_type": "ORDER_CREATED",
+                "order_id": order_id,
+                "internal_order_id": order_id,
+                "trade_id": f"T-{order_id}",
+                "symbol": symbol,
+                "strategy": strategy,
+                "quantity": str(quantity),
+                "side": side,
+                "order_type": order_type,
+                "state": OrderStatus.PENDING.value,
+            })
+
             self.logger.info(f"Order created: {order_id}", extra={
                 "order_id": order_id, "symbol": symbol, "quantity": str(quantity)
             })
-            
+
             return order
     
     def get_order(self, order_id: str) -> Optional[Order]:
@@ -514,12 +528,132 @@ class OrderStateMachine:
         """Validate transition without executing."""
         if from_state in self._terminal_states:
             return False, f"{from_state.value} is terminal"
-        
+
         transition = self._transition_map.get((from_state, to_state))
         if not transition:
             return False, f"No transition {from_state.value} → {to_state.value}"
-        
+
         if transition.requires_broker_confirmation and not broker_order_id:
             return False, "Broker confirmation required"
-        
+
         return True, None
+
+    # ========================================================================
+    # PATCH 6: PENDING ORDER PERSISTENCE
+    # ========================================================================
+
+    def restore_pending_orders(self, transaction_log) -> int:
+        """
+        Replay the transaction log and restore any orders that were
+        SUBMITTED (or PARTIALLY_FILLED) but never reached a terminal
+        state before the process stopped.
+
+        Algorithm:
+          1. Scan every event in the log.
+          2. Track the *latest* state for each internal_order_id.
+          3. For any order whose last known state is non-terminal,
+             recreate it in ``_orders`` with that state.
+
+        Returns the number of orders restored.
+
+        This method is idempotent — calling it twice does not duplicate
+        orders because ``_orders`` is keyed by order_id.
+        """
+        # Track the latest state per order_id.
+        # Events come in two shapes:
+        #   a) OrderStateChangedEvent (from OrderStateMachine.transition):
+        #      {"order_id": ..., "from_state": ..., "to_state": ..., "broker_order_id": ...}
+        #   b) Engine / runtime events:
+        #      {"event_type": "ORDER_SUBMIT", "internal_order_id": ..., ...}
+        order_states: Dict[str, Dict] = {}
+
+        for ev in transaction_log.iter_events():
+            # Resolve the order identifier (different key names)
+            iid = ev.get("order_id") or ev.get("internal_order_id")
+            if not iid:
+                continue
+
+            # Determine the resulting state from this event.
+            # Shape (a): has to_state directly
+            state_str: Optional[str] = ev.get("to_state")
+
+            # Shape (b): derive state from event_type
+            if not state_str:
+                et = str(ev.get("event_type") or ev.get("event") or "").upper().strip()
+                if et == "ORDER_CREATED":
+                    state_str = ev.get("state") or "PENDING"
+                elif et in ("ORDER_SUBMIT", "ORDERSTATECHANGED"):
+                    state_str = ev.get("state")
+                elif et == "ORDER_FILLED":
+                    state_str = "FILLED"
+                elif et in ("ORDER_CANCELLED", "CANCEL"):
+                    state_str = "CANCELLED"
+                elif et == "ORDER_REJECTED":
+                    state_str = "REJECTED"
+                elif et == "ORDER_EXPIRED":
+                    state_str = "EXPIRED"
+
+            # Accumulate metadata
+            if iid not in order_states:
+                order_states[iid] = {
+                    "order_id": iid,
+                    "symbol": ev.get("symbol"),
+                    "strategy": ev.get("strategy"),
+                    "quantity": ev.get("qty") or ev.get("quantity"),
+                    "side": ev.get("side"),
+                    "order_type": ev.get("order_type"),
+                    "broker_order_id": ev.get("broker_order_id"),
+                    "state": state_str,
+                }
+            else:
+                # Update with latest info
+                if state_str:
+                    order_states[iid]["state"] = state_str
+                for key in ("symbol", "strategy", "broker_order_id", "side", "order_type"):
+                    if ev.get(key):
+                        order_states[iid][key] = ev.get(key)
+                if ev.get("qty") or ev.get("quantity"):
+                    order_states[iid]["quantity"] = ev.get("qty") or ev.get("quantity")
+
+        # Restore non-terminal orders
+        restored = 0
+        terminal_values = {s.value for s in self._terminal_states}
+
+        with self._lock:
+            for iid, info in order_states.items():
+                last_state = info.get("state")
+                if not last_state or last_state in terminal_values:
+                    continue
+                if iid in self._orders:
+                    continue  # already present
+
+                # Map state string to enum
+                try:
+                    status = OrderStatus(last_state)
+                except ValueError:
+                    continue
+
+                qty_raw = info.get("quantity")
+                try:
+                    qty = Decimal(str(qty_raw)) if qty_raw else Decimal("0")
+                except Exception:
+                    qty = Decimal("0")
+
+                order = Order(
+                    order_id=iid,
+                    symbol=info.get("symbol") or "UNKNOWN",
+                    strategy=info.get("strategy") or "UNKNOWN",
+                    quantity=qty,
+                    side=info.get("side") or "BUY",
+                    order_type=info.get("order_type") or "MARKET",
+                    state=status,
+                    broker_order_id=info.get("broker_order_id"),
+                )
+                self._orders[iid] = order
+                restored += 1
+                self.logger.info(
+                    "Restored pending order: %s state=%s",
+                    iid, status.value,
+                )
+
+        return restored

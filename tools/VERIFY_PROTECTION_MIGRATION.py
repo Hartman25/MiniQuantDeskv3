@@ -7,12 +7,13 @@ Tests that:
 3. Protection checks work correctly
 """
 
+import os
 from decimal import Decimal
 from datetime import datetime, timezone
 from pathlib import Path
 
 from core.di.container import Container
-from core.risk.protections_old.base import ProtectionContext
+from core.risk.protections.base import ProtectionContext
 
 
 def test_protection_migration():
@@ -20,7 +21,10 @@ def test_protection_migration():
     
     print("[1/4] Initializing container...")
     container = Container()
-    config_path = "C:/Users/Zacha/Desktop/MiniQuantDeskv2/config/config_micro.yaml"
+    config_path = os.environ.get(
+        "MINIQUANT_CONFIG",
+        str(Path(__file__).resolve().parent.parent / "config" / "config_micro.yaml"),
+    )
     
     if not Path(config_path).exists():
         print(f"ERROR: Config not found: {config_path}")

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-base = Path(r"C:\Users\Zacha\Desktop\MiniQuantDeskv2")
+base = Path(__file__).resolve().parent.parent
 
 core_files = [
     ("State", ["core/state/order_machine.py", "core/state/position_store.py", "core/state/transaction_log.py", "core/state/reconciler.py"]),
