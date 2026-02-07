@@ -1,8 +1,8 @@
 """
 Paper-truth integration tests – validate real Alpaca paper behaviour.
 
-These tests are SKIPPED by default unless all three env vars are set:
-    ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER_URL
+These tests are SKIPPED by default unless both env vars are set:
+    ALPACA_API_KEY, ALPACA_API_SECRET
 
 Run explicitly:
     python -m pytest -m integration -v
@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import time
 from decimal import Decimal
+from datetime import datetime, timezone
 
 import pytest
 
@@ -182,6 +183,67 @@ class TestPaperTruth:
         try:
             broker.cancel_order(stop_id)
             time.sleep(1)
+            broker.submit_order(
+                symbol="SPY", qty=1, side="sell",
+                order_type="market", time_in_force="day",
+            )
+            time.sleep(2)
+        except Exception:
+            pass
+
+    def test_restart_reconciliation_restores_position(self, broker):
+        """
+        GIVEN: A filled BUY position exists at the broker
+        WHEN:  We create a fresh PositionStore + reconciler (simulating restart)
+        THEN:  reconcile_startup() detects the broker position and returns
+               a discrepancy indicating the local store is missing it.
+        """
+        from core.state.position_store import PositionStore
+        from core.state.reconciler import StartupReconciler
+
+        # 1. Open a real position at the broker
+        order = broker.submit_order(
+            symbol="SPY",
+            qty=1,
+            side="buy",
+            order_type="market",
+            time_in_force="day",
+        )
+        order_id = getattr(order, "id", None) or order.get("id")
+        for _ in range(10):
+            time.sleep(1)
+            status = broker.get_order_status(order_id)
+            if status == "filled":
+                break
+        assert status == "filled", f"Setup: expected filled, got {status}"
+
+        # 2. Create an EMPTY local position store (simulating restart with clean state)
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ps = PositionStore(
+                db_path=os.path.join(tmpdir, "positions.db"),
+            )
+
+            # Minimal order tracker stub
+            class _StubTracker:
+                def get_open_orders(self, symbol=None):
+                    return []
+
+            reconciler = StartupReconciler(
+                broker=broker,
+                position_store=ps,
+                order_tracker=_StubTracker(),
+            )
+
+            discrepancies = reconciler.reconcile_startup()
+            # Must detect at least one discrepancy: broker has SPY, local doesn't
+            spy_discs = [d for d in discrepancies if getattr(d, "symbol", "") == "SPY"]
+            assert len(spy_discs) > 0, (
+                f"Expected discrepancy for SPY, got: {discrepancies}"
+            )
+
+        # 3. Cleanup: sell the position
+        try:
             broker.submit_order(
                 symbol="SPY", qty=1, side="sell",
                 order_type="market", time_in_force="day",

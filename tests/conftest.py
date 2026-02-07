@@ -14,22 +14,10 @@ import time
 
 # tests/conftest.py
 
-# Pytest collection control: keep Phase 1 green and focused.
-# Anything listed here will not be collected/runs even if present.
-collect_ignore = [
-    "tests/acceptance/test_phase2_strategy_correctness.py",
-    "tests/acceptance/test_phase3_risk_survivability.py",
-    "tests/patch4",
-    "tests/strategies/test_vwap_micro_mean_reversion.py",
-    "tests/test_integration_comprehensive.py",
-    "tests/test_monitoring.py",
-    "tests/test_recovery.py",
-    "tests/test_risk_management.py",
-    "tests/test_risk_protections.py",
-    "tests/test_unified_protections.py",
-    "tests/test_universe_system.py",
-    "tests/test_patch2_1_paper_auto_heal.py",
-]
+# Pytest collection control.
+# All 12 original entries removed — they referred to files that no longer exist.
+# If future files need exclusion, add them here explicitly.
+collect_ignore = []
 
 # -------------------------
 # Fakes used by integration tests
