@@ -457,4 +457,40 @@
   - ✅ Reproducible RNG via explicit seed
 
 ## PATCH 15: Enforce config discipline with schema validation
-- **Status:** TODO
+- **Status:** DONE
+- **Summary:** Added `core/config/validator.py` with structured config validation
+  layer.  `validate_config()` returns all errors at once (not just the first) as
+  `ConfigError` objects with path, message, and error_type.  Strict mode rejects
+  unknown keys at top level, within sections, and within strategy configs.
+  `FrozenConfig` wraps a validated dict and blocks post-load mutation.
+  `config_hash()` detects drift between load and use.
+- **Files changed:**
+  - `core/config/validator.py` (NEW)
+  - `tests/p1/test_patch15_config_discipline.py` (NEW — 16 tests)
+- **Tests added:**
+  - `test_valid_config_ok` — valid config passes
+  - `test_missing_required_section` — missing broker → error
+  - `test_invalid_type` — string where int expected → error
+  - `test_value_out_of_range` — below minimum → value_error
+  - `test_extra_top_level_key_strict` — unknown top key rejected
+  - `test_extra_section_key_strict` — unknown section key rejected
+  - `test_extra_strategy_key` — unknown strategy key rejected
+  - `test_non_strict_ignores_extras` — non-strict is lenient
+  - `test_multiple_errors_collected` — all errors at once
+  - `test_summary_human_readable` — summary() formatting
+  - `test_config_error_str` — ConfigError.__str__
+  - `test_config_hash_deterministic` — same data → same hash
+  - `test_config_hash_differs` — different data → different hash
+  - `test_frozen_config_immutable` — setattr blocked
+  - `test_frozen_config_get` — dotted path navigation
+  - `test_frozen_config_integrity` — integrity check passes
+- **Commands run + results:**
+  - `python -m py_compile core/config/validator.py` → OK
+  - `python -m py_compile core/runtime/app.py` → OK
+  - `python -m pytest -q` → 120 passed
+  - `python -m pytest tests/p1/test_patch15_config_discipline.py -v` → 16 passed
+- **Done definition:**
+  - ✅ validate_config() returns all errors at once (not just first)
+  - ✅ Strict mode rejects unknown keys
+  - ✅ FrozenConfig prevents post-load mutation
+  - ✅ config_hash detects drift
