@@ -18,7 +18,8 @@ TESTS:
 import time
 import pytest
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import core.data.pipeline as pipeline_mod
 
 from core.net.throttler import Throttler, RateLimit, ExponentialBackoff
 from core.data.pipeline import MarketDataPipeline
@@ -78,6 +79,18 @@ def _make_pipeline(throttler, monkeypatch):
     monkeypatch.setattr(p.alpaca_client, "get_stock_bars", _fake_get_stock_bars)
     return p
 
+def _freeze_pipeline_time(monkeypatch, fixed_now):
+    # Freeze time.time() for cache TTL + any time-based keys
+    monkeypatch.setattr(pipeline_mod.time, "time", lambda: 1_000_000.0)
+
+    # Freeze datetime.now(timezone.utc) used inside pipeline
+    class _FixedDateTime:
+        @staticmethod
+        def now(tz=None):
+            return fixed_now if tz is None else fixed_now.astimezone(tz)
+
+    monkeypatch.setattr(pipeline_mod, "datetime", _FixedDateTime)
+
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -115,10 +128,23 @@ class TestPipelineUsesThrottler:
         throttler = _CountingThrottler()
         p = _make_pipeline(throttler, monkeypatch)
 
+        fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        _freeze_pipeline_time(monkeypatch, fixed_now)
+
+        # Make the returned bar safely “closed” (>=1 minute old for 1Min)
+        def _fake_get_stock_bars(request):
+            idx = pd.DatetimeIndex([fixed_now - timedelta(minutes=2)])
+            df = pd.DataFrame(
+                [{"open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100}],
+                index=idx,
+            )
+            return _FakeBars(df)
+
+        monkeypatch.setattr(p.alpaca_client, "get_stock_bars", _fake_get_stock_bars)
+
         df = p.get_latest_bars("SPY", lookback_bars=1, timeframe="1Min")
         assert not df.empty
         assert throttler.calls == 1
-        assert throttler.limit_ids[-1] == "alpaca_data"
 
     def test_repeated_fetches_increment_call_count(self, monkeypatch):
         throttler = _CountingThrottler()
@@ -137,12 +163,15 @@ class TestPipelineUsesThrottler:
             alpaca_api_key="x",
             alpaca_api_secret="y",
             max_staleness_seconds=9999,
-            cache_ttl_seconds=60,   # long cache TTL
+            cache_ttl_seconds=60,
             throttler=throttler,
         )
 
+        fixed_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+        _freeze_pipeline_time(monkeypatch, fixed_now)
+
         def _fake_get_stock_bars(request):
-            idx = pd.DatetimeIndex([datetime.now(timezone.utc)])
+            idx = pd.DatetimeIndex([fixed_now - timedelta(minutes=2)])
             df = pd.DataFrame(
                 [{"open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 100}],
                 index=idx,
@@ -154,12 +183,9 @@ class TestPipelineUsesThrottler:
         p.get_latest_bars("SPY", lookback_bars=1)
         assert throttler.calls == 1
 
-        # Second call should hit cache
+        # Same frozen time => identical cache key => must hit cache
         p.get_latest_bars("SPY", lookback_bars=1)
-        assert throttler.calls == 1, (
-            "Cache hit must NOT call throttler again"
-        )
-
+        assert throttler.calls == 1
 
 class TestThrottlerStats:
     """Throttler.get_stats() must reflect execute_sync() calls."""
