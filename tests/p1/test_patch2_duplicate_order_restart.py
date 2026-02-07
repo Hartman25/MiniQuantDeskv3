@@ -145,15 +145,15 @@ class TestDuplicateOrderRestartEdgeCases:
         )
         assert bid is not None
 
-        # Same ID again in same session → DuplicateOrderError
-        with pytest.raises(DuplicateOrderError):
-            engine.submit_market_order(
-                internal_order_id="ORD-dup-sess",
-                symbol="SPY",
-                quantity=Decimal("5"),
-                side=BrokerOrderSide.BUY,
-                strategy="TestStrat",
-            )
+        # Same ID again in same session → idempotent: returns same broker_order_id, no new submit
+        bid2 = engine.submit_market_order(
+            internal_order_id="ORD-dup-sess",
+            symbol="SPY",
+            quantity=Decimal("5"),
+            side=BrokerOrderSide.BUY,
+            strategy="TestStrat",
+        )
+        assert bid2 == bid
 
         sm_log.close()
         bus.stop()

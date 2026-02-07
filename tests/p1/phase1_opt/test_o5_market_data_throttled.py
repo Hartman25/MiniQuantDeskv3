@@ -1,5 +1,5 @@
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from core.data.pipeline import MarketDataPipeline
 
 class _CountingThrottler:
@@ -35,7 +35,10 @@ def test_market_data_pipeline_uses_throttler_execute_sync(monkeypatch):
             return _Obj(self._df)
 
     def fake_get_stock_bars(request):
-        idx = pd.DatetimeIndex([datetime.now(timezone.utc)])
+        now = datetime.now(timezone.utc)
+        closed_minute = (now.replace(second=0, microsecond=0) - timedelta(minutes=1))
+        idx = pd.DatetimeIndex([closed_minute])
+
         df = pd.DataFrame(
             [{"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}],
             index=idx
