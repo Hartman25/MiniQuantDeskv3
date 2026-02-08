@@ -51,6 +51,21 @@ class FakeBrokerConnector:
         """Return no position."""
         return None
 
+    def get_positions(self):
+        """
+        Match production broker interface.
+        Return a list of open positions.
+        """
+        # If you track positions internally
+        if hasattr(self, "_positions"):
+            return list(self._positions.values())
+
+        # Fallback if only single-position logic exists
+        try:
+            p = self.get_position("SPY")
+            return [p] if p else []
+        except Exception:
+            return []
 
 class FakeProtections:
     """Minimal protections that never block."""
