@@ -46,6 +46,100 @@ from core.state.position_store import Position
 logger = get_logger(LogStream.SYSTEM)
 
 
+def _load_runtime_env(config_path: Optional[os.PathLike[str] | str] = None) -> None:
+    """Load .env files (especially .env.local) into process env.
+
+    Goals:
+      - Keep secrets OUT of config.yaml (committable), prefer env vars.
+      - Let local dev use .env.local without breaking CI/tests.
+
+    Behavior:
+      - If python-dotenv is installed, load (in order):
+          1) .env.local
+          2) .env
+        searched in:
+          - current working directory
+          - config file's directory (if provided)
+      - Does nothing if MQD_DISABLE_DOTENV is set to a truthy value.
+    """
+    if os.getenv("MQD_DISABLE_DOTENV", "").strip().lower() in ("1", "true", "yes"):
+        return
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return  # python-dotenv not installed -> silently skip
+
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path.cwd())
+    except Exception:
+        pass
+
+    if config_path is not None:
+        try:
+            candidates.append(Path(config_path).expanduser().resolve().parent)
+        except Exception:
+            pass
+
+    # de-dupe, preserve order
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for p in candidates:
+        s = str(p)
+        if s not in seen:
+            uniq.append(p)
+            seen.add(s)
+
+    for base in uniq:
+        for name in (".env.local", ".env"):
+            fp = base / name
+            if fp.exists() and fp.is_file():
+                # Do NOT override real env vars (CI / production wins)
+                load_dotenv(dotenv_path=fp, override=False)
+
+
+def _resolve_alpaca_credentials(cfg: Any) -> tuple[str, str]:
+    """Resolve Alpaca credentials from config OR environment variables.
+
+    Supported env var names (common variants):
+      - APCA_API_KEY_ID / APCA_API_SECRET_KEY  (Alpaca official)
+      - ALPACA_API_KEY / ALPACA_API_SECRET
+      - ALPACA_KEY_ID / ALPACA_SECRET_KEY
+    """
+    broker_cfg = getattr(cfg, "broker", None)
+    api_key = getattr(broker_cfg, "api_key", None) or ""
+    api_secret = getattr(broker_cfg, "api_secret", None) or ""
+
+    api_key = (str(api_key).strip() if api_key is not None else "")
+    api_secret = (str(api_secret).strip() if api_secret is not None else "")
+
+    if not api_key:
+        api_key = (
+            os.getenv("APCA_API_KEY_ID", "")
+            or os.getenv("ALPACA_API_KEY", "")
+            or os.getenv("ALPACA_KEY_ID", "")
+        ).strip()
+
+    if not api_secret:
+        api_secret = (
+            os.getenv("APCA_API_SECRET_KEY", "")
+            or os.getenv("ALPACA_API_SECRET", "")
+            or os.getenv("ALPACA_SECRET_KEY", "")
+        ).strip()
+
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "Missing Alpaca credentials. Provide them either in config.yaml "
+            "(broker.api_key / broker.api_secret) OR as environment variables "
+            "(APCA_API_KEY_ID and APCA_API_SECRET_KEY are recommended). "
+            "For local dev, put them in .env.local."
+        )
+
+    return api_key, api_secret
+
+
+
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -448,22 +542,99 @@ def _synthetic_bar(symbol: str) -> MarketDataContract:
         provider="synthetic",
     )
 
+def _assert_phase1_invariants(*, paper: bool) -> None:
+    """
+    PATCH 1 — Phase-1 containment guard.
+
+    Phase 1 is correctness validation. We fail-fast if:
+      - not running in paper mode
+      - async risk gate is enabled (Phase 2+ feature)
+
+    Legacy import wall:
+      - In strict mode, fail if any core._legacy modules are loaded.
+      - In non-strict mode (default), warn only. This avoids breaking tests
+        when legacy modules are imported as side-effects but not actually used.
+    """
+    import os
+    import sys
+
+    if not paper:
+        raise RuntimeError("PHASE 1 INVARIANT: must run in PAPER mode (refusing live).")
+
+    # Async risk gate is Phase-2+. Require explicit opt-in.
+    if os.getenv("MQD_ENABLE_ASYNC_RISK_GATE", "").strip().lower() in ("1", "true", "yes"):
+        raise RuntimeError(
+            "PHASE 1 INVARIANT: async PreTradeRiskGate is disabled in Phase 1. "
+            "Unset MQD_ENABLE_ASYNC_RISK_GATE."
+        )
+
+    # Legacy wall: strict mode only
+    legacy_loaded = [m for m in sys.modules.keys() if m.startswith("core._legacy")]
+    if legacy_loaded:
+        strict = os.getenv("MQD_STRICT_NO_LEGACY", "").strip().lower() in ("1", "true", "yes")
+        if strict:
+            raise RuntimeError(
+                "PHASE 1 INVARIANT: legacy modules loaded during runtime: "
+                f"{legacy_loaded[:8]}{'...' if len(legacy_loaded) > 8 else ''}"
+            )
+        else:
+            # Don't hard-fail tests; warn so it still shows up in logs.
+            try:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "PHASE 1 WARNING: legacy modules are import-loaded (non-strict): %s",
+                    legacy_loaded[:8]
+                )
+            except Exception:
+                pass
 
 def run(opts: RunOptions) -> int:
-    """Run the trading app. Returns exit code: 0 success, 1 safety halt/failure."""
     container = Container()
     container.initialize(opts.config_path)
 
     cfg = container.get_config()
 
+    _load_runtime_env(opts.config_path)  # PATCH 2: load .env.local/.env early
+
     paper = opts.mode == "paper"
+    _assert_phase1_invariants(paper=paper)
+
     cfg.broker.paper_trading = paper
 
-    broker = AlpacaBrokerConnector(
-        api_key=cfg.broker.api_key,
-        api_secret=cfg.broker.api_secret,
-        paper=paper,
+    # Resolve broker credentials. Env vars override YAML to keep secrets out of configs.
+    # Supported names:
+    #   - BROKER_API_KEY / BROKER_API_SECRET (preferred)
+    #   - ALPACA_API_KEY / ALPACA_API_SECRET (legacy)
+    #   - APCA_API_KEY_ID / APCA_API_SECRET_KEY (Alpaca SDK convention)
+    api_key = (
+        os.getenv("BROKER_API_KEY")
+        or os.getenv("ALPACA_API_KEY")
+        or os.getenv("APCA_API_KEY_ID")
+        or getattr(cfg.broker, "api_key", None)
+        or getattr(cfg.broker, "key_id", None)
     )
+    api_secret = (
+        os.getenv("BROKER_API_SECRET")
+        or os.getenv("ALPACA_API_SECRET")
+        or os.getenv("APCA_API_SECRET_KEY")
+        or getattr(cfg.broker, "api_secret", None)
+        or getattr(cfg.broker, "secret_key", None)
+    )
+
+    if not api_key or not api_secret:
+        raise RuntimeError(
+            "Missing broker credentials. Set BROKER_API_KEY and BROKER_API_SECRET "
+            "(or ALPACA_API_KEY/ALPACA_API_SECRET, or APCA_API_KEY_ID/APCA_API_SECRET_KEY)."
+        )
+
+    broker = AlpacaBrokerConnector(
+        api_key=api_key,
+        api_secret=api_secret,
+        paper=paper,
+        base_url=getattr(cfg.broker, "base_url", None),
+        data_feed=getattr(cfg.broker, "data_feed", None),
+    )
+
     container.set_broker_connector(broker)
 
     # Register strategies

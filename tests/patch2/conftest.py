@@ -15,7 +15,7 @@ import pytest
 
 class FakeBrokerConnector:
     """Replaces AlpacaBrokerConnector: no network, just minimal surface."""
-    def __init__(self, api_key: str, api_secret: str, paper: bool = True):
+    def __init__(self, api_key: str = "", api_secret: str = "", paper: bool = True, **kwargs):
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper = paper

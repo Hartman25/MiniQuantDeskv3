@@ -186,37 +186,49 @@ class PreTradeRiskGate:
     # ========================================================================
     
     def start(self) -> None:
-        """Start risk gate worker thread."""
+        """Start risk gate worker thread.
+
+        PATCH 1:
+        - Async risk gate is Phase-2+ only.
+        - Refuse to start unless MQD_ENABLE_ASYNC_RISK_GATE=1 (explicit opt-in).
+        """
+        import os
+
+        if os.getenv("MQD_ENABLE_ASYNC_RISK_GATE", "").strip().lower() not in ("1", "true", "yes"):
+            logger.warning("[RISK_GATE] Async gate disabled (Phase 1 containment). Not starting.")
+            self._running = False
+            return
+
         if self._running:
             logger.warning("[RISK_GATE] Already running")
             return
-        
+
         self._running = True
         self._shutdown_event.clear()
-        
+
         self._worker_thread = Thread(
             target=self._process_queue,
             name="RiskGateWorker",
             daemon=True
         )
         self._worker_thread.start()
-        
+
         logger.info("[RISK_GATE] Started")
-    
+
     def stop(self) -> None:
         """Stop risk gate worker thread."""
         if not self._running:
             return
-        
+
         logger.info("[RISK_GATE] Stopping...")
         self._shutdown_event.set()
         self._running = False
-        
+
         if self._worker_thread:
             self._worker_thread.join(timeout=5.0)
-        
+
         logger.info("[RISK_GATE] Stopped")
-    
+
     # ========================================================================
     # ORDER SUBMISSION
     # ========================================================================
@@ -227,55 +239,43 @@ class PreTradeRiskGate:
         timeout: float = 5.0
     ) -> GateDecision:
         """
-        Submit order for risk validation.
-        
-        BLOCKS until gate processes request or timeout.
-        
-        Args:
-            request: Order request
-            timeout: Max seconds to wait
-            
-        Returns:
-            GateDecision (approved or rejected)
-            
-        Raises:
-            RiskGateTimeout: If gate doesn't respond in time
+        Submit order for risk validation (async gate).
+
+        PATCH 1:
+        - If gate is not running (Phase 1), FAIL CLOSED immediately.
         """
         if not self._running:
             return GateDecision(
                 order_id=request.order_id,
                 approved=False,
-                rejection_reason="Risk gate not running"
+                rejection_reason="Async risk gate disabled/not running (Phase 1 containment)"
             )
-        
+
         # Submit to queue
         self._request_queue.put(request)
-        
+
         # Wait for decision (polling with timeout)
         start_time = datetime.now(timezone.utc)
         while True:
             with self._lock:
                 decision = self._decision_map.get(request.order_id)
                 if decision:
-                    # Remove from map and return
                     del self._decision_map[request.order_id]
                     return decision
-            
-            # Check timeout
+
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
             if elapsed > timeout:
-                logger.error(
-                    f"[RISK_GATE] Timeout waiting for decision on {request.order_id}"
-                )
+                logger.error(f"[RISK_GATE] Timeout waiting for decision on {request.order_id}")
                 return GateDecision(
                     order_id=request.order_id,
                     approved=False,
                     rejection_reason=f"Risk gate timeout after {timeout}s"
                 )
-            
-            # Sleep briefly
-            Event().wait(0.1)
-    
+
+            # Avoid allocating Event() repeatedly; keep it simple.
+            import time as _time
+            _time.sleep(0.1)
+
     # ========================================================================
     # WORKER THREAD
     # ========================================================================

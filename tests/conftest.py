@@ -5,13 +5,13 @@ from dataclasses import dataclass
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple, Optional
-
+import os
 import pandas as pd
 import pytest
 import threading
 import atexit
 import time
-
+from core.config.env import load_env
 # tests/conftest.py
 
 # Pytest collection control.
@@ -559,6 +559,18 @@ def patch_runtime(monkeypatch, tmp_path):
 
     return _run_once
 
+def pytest_configure():
+    # Load .env if present (optional dependency).
+    try:
+        from dotenv import load_dotenv
+    except Exception:
+        return
+
+    # Try common filenames
+    for p in (".env", ".env.local", "config/.env", "config/.env.local"):
+        if os.path.exists(p):
+            load_dotenv(p, override=False)
+            break
 
 @pytest.fixture
 def results():

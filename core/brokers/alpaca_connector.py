@@ -64,8 +64,12 @@ class AlpacaBrokerConnector:
     RETRY_DELAY_SECONDS = 1.0
     RETRY_BACKOFF_MULTIPLIER = 2.0
     
-    def __init__(self, api_key: str, api_secret: str, paper: bool = True):
-        """Initialize Alpaca connector."""
+    def __init__(self, api_key: str, api_secret: str, paper: bool = True, **kwargs):
+        """Initialize Alpaca connector.
+
+        Extra kwargs (base_url, data_feed, etc.) are accepted for forward
+        compatibility but currently unused by the Alpaca v2 SDK wrapper.
+        """
         self.api_key = api_key
         self.api_secret = api_secret
         self.paper = paper

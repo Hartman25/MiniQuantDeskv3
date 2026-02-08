@@ -1,7 +1,7 @@
 """
-Paper-truth integration tests – validate real Alpaca paper behaviour.
+Paper-truth integration tests -- validate real Alpaca paper behaviour.
 
-These tests are SKIPPED by default unless both env vars are set:
+SKIPPED by default unless both env vars are set:
     ALPACA_API_KEY, ALPACA_API_SECRET
 
 Run explicitly:
@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from decimal import Decimal
-from datetime import datetime, timezone
 
 import pytest
 
@@ -28,6 +28,38 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(bool(_MISSING), reason=_SKIP_REASON),
 ]
+
+
+def _uid() -> str:
+    return f"pt-{uuid.uuid4().hex[:12]}"
+
+
+def _market_is_open() -> bool:
+    """Check if US equity market is likely open (rough heuristic).
+
+    Uses Alpaca's clock API if available, falls back to wall-clock check.
+    """
+    try:
+        from alpaca.trading.client import TradingClient
+        client = TradingClient(
+            api_key=os.environ.get("ALPACA_API_KEY", ""),
+            secret_key=os.environ.get("ALPACA_API_SECRET", ""),
+            paper=True,
+        )
+        clock = client.get_clock()
+        return clock.is_open
+    except Exception:
+        pass
+    # Fallback: weekday 9:30-16:00 ET
+    from datetime import datetime, timezone, timedelta
+    et = timezone(timedelta(hours=-5))
+    now = datetime.now(et)
+    if now.weekday() >= 5:
+        return False
+    return now.hour * 60 + now.minute >= 570 and now.hour < 16
+
+
+_MARKET_CLOSED_REASON = "US equity market is closed; market orders won't fill"
 
 
 # ── fixtures ─────────────────────────────────────────────────────────────────
@@ -43,17 +75,38 @@ def broker():
         paper=True,
     )
     yield conn
-    # Cleanup: cancel all open orders left by tests
+    # Best-effort cleanup: cancel any open orders left by tests
     try:
-        conn.cancel_all_orders()
+        for o in conn.get_orders(status="open"):
+            try:
+                oid = getattr(o, "id", None) or (o.get("id") if isinstance(o, dict) else None)
+                if oid:
+                    conn.cancel_order(oid)
+            except Exception:
+                pass
     except Exception:
         pass
 
 
 @pytest.fixture(scope="module")
 def account_info(broker):
-    """Fetch account once per module – proves connectivity."""
+    """Fetch account once per module -- proves connectivity."""
     return broker.get_account_info()
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+def _wait_for_status(broker, broker_order_id, target, timeout_s=10):
+    """Poll get_order_status until target OrderStatus (or timeout)."""
+    from core.state.order_machine import OrderStatus as OS
+    target_set = {target} if not isinstance(target, set) else target
+    status = None
+    for _ in range(timeout_s):
+        status, _info = broker.get_order_status(broker_order_id)
+        if status in target_set:
+            return status, _info
+        time.sleep(1)
+    return status, None
 
 
 # ── tests ────────────────────────────────────────────────────────────────────
@@ -73,158 +126,144 @@ class TestPaperTruth:
 
     def test_limit_order_ttl_cancel(self, broker):
         """
-        GIVEN: A LIMIT BUY far below market → won't fill
+        GIVEN: A LIMIT BUY far below market -> won't fill
         WHEN:  We wait briefly, then cancel
         THEN:  The order is cancelled without fill.
         """
-        # Place a LIMIT order at $1 for SPY (will never fill)
-        order = broker.submit_order(
+        from core.brokers.alpaca_connector import BrokerOrderSide
+        from core.state.order_machine import OrderStatus as OS
+
+        broker_oid = broker.submit_limit_order(
             symbol="SPY",
-            qty=1,
-            side="buy",
-            order_type="limit",
+            quantity=Decimal("1"),
+            side=BrokerOrderSide.BUY,
             limit_price=Decimal("1.00"),
-            time_in_force="day",
+            internal_order_id=_uid(),
         )
-        assert order is not None, "submit_order must return an order object"
-        order_id = getattr(order, "id", None) or order.get("id")
-        assert order_id, "order must have an id"
+        assert broker_oid, "submit_limit_order must return a broker_order_id"
 
-        time.sleep(1)  # brief pause
+        time.sleep(1)
 
-        # Cancel it
-        cancelled = broker.cancel_order(order_id)
-        # Accept True, None, or no exception as success
-        # (some connectors return None on success)
+        cancelled = broker.cancel_order(broker_oid)
         assert cancelled is not False, "cancel_order should not return False"
 
-        # Verify order is no longer open
-        time.sleep(1)
-        status = broker.get_order_status(order_id)
-        assert status in ("canceled", "cancelled", "expired", "replaced"), (
-            f"Expected canceled status, got: {status}"
+        status, _ = _wait_for_status(broker, broker_oid, {OS.CANCELLED, OS.EXPIRED}, timeout_s=5)
+        assert status in (OS.CANCELLED, OS.EXPIRED), (
+            f"Expected CANCELLED/EXPIRED, got: {status}"
         )
 
+    @pytest.mark.skipif(not _market_is_open(), reason=_MARKET_CLOSED_REASON)
     def test_market_order_fills(self, broker):
         """
         GIVEN: A MARKET BUY for 1 share of SPY
         WHEN:  We wait for the fill
-        THEN:  A fill with price > 0 and qty == 1 is returned,
-               and a journal/order ID is assigned.
+        THEN:  A fill with price > 0 and qty == 1 is returned.
         """
-        order = broker.submit_order(
+        from core.brokers.alpaca_connector import BrokerOrderSide
+        from core.state.order_machine import OrderStatus as OS
+
+        broker_oid = broker.submit_market_order(
             symbol="SPY",
-            qty=1,
-            side="buy",
-            order_type="market",
-            time_in_force="day",
+            quantity=Decimal("1"),
+            side=BrokerOrderSide.BUY,
+            internal_order_id=_uid(),
         )
-        order_id = getattr(order, "id", None) or order.get("id")
-        assert order_id, "market order must have an id"
+        assert broker_oid, "market order must return a broker_order_id"
 
-        # Wait for fill (paper fills are near-instant)
-        for _ in range(10):
-            time.sleep(1)
-            status = broker.get_order_status(order_id)
-            if status == "filled":
-                break
-        assert status == "filled", f"Expected filled, got {status} after 10s"
+        status, fill_info = _wait_for_status(broker, broker_oid, OS.FILLED, timeout_s=10)
+        assert status == OS.FILLED, f"Expected FILLED, got {status} after 10s"
+        assert fill_info is not None, "fill_info must not be None for a filled order"
 
-        # Cleanup: close the position
+        # Cleanup: sell position
         try:
-            broker.submit_order(
+            broker.submit_market_order(
                 symbol="SPY",
-                qty=1,
-                side="sell",
-                order_type="market",
-                time_in_force="day",
-            )
-            time.sleep(2)  # wait for cleanup fill
-        except Exception:
-            pass  # best-effort cleanup
-
-    def test_protective_stop_accepted(self, broker):
-        """
-        GIVEN: An open long position
-        WHEN:  We submit a STOP sell order at a price below market
-        THEN:  The order is accepted and shows as 'new' or 'accepted'.
-        """
-        # Open a 1-share position
-        entry = broker.submit_order(
-            symbol="SPY",
-            qty=1,
-            side="buy",
-            order_type="market",
-            time_in_force="day",
-        )
-        entry_id = getattr(entry, "id", None) or entry.get("id")
-        time.sleep(3)  # let fill settle
-
-        # Submit stop at ~$1 below the assumed market (~$400+).
-        # Use a very low stop so it won't trigger during test.
-        stop = broker.submit_order(
-            symbol="SPY",
-            qty=1,
-            side="sell",
-            order_type="stop",
-            stop_price=Decimal("50.00"),  # far below market
-            time_in_force="day",
-        )
-        stop_id = getattr(stop, "id", None) or stop.get("id")
-        assert stop_id, "stop order must have an id"
-
-        time.sleep(1)
-        status = broker.get_order_status(stop_id)
-        assert status in ("new", "accepted", "held", "pending_new"), (
-            f"Expected stop to be accepted, got: {status}"
-        )
-
-        # Cleanup: cancel stop, sell position
-        try:
-            broker.cancel_order(stop_id)
-            time.sleep(1)
-            broker.submit_order(
-                symbol="SPY", qty=1, side="sell",
-                order_type="market", time_in_force="day",
+                quantity=Decimal("1"),
+                side=BrokerOrderSide.SELL,
+                internal_order_id=_uid(),
             )
             time.sleep(2)
         except Exception:
             pass
 
-    def test_restart_reconciliation_restores_position(self, broker):
+    @pytest.mark.skipif(not _market_is_open(), reason=_MARKET_CLOSED_REASON)
+    def test_protective_stop_accepted(self, broker):
+        """
+        GIVEN: An open long position
+        WHEN:  We submit a STOP sell order far below market
+        THEN:  The order is accepted (SUBMITTED / PENDING).
+        """
+        from core.brokers.alpaca_connector import BrokerOrderSide
+        from core.state.order_machine import OrderStatus as OS
+
+        # Open a 1-share position
+        entry_oid = broker.submit_market_order(
+            symbol="SPY",
+            quantity=Decimal("1"),
+            side=BrokerOrderSide.BUY,
+            internal_order_id=_uid(),
+        )
+        _wait_for_status(broker, entry_oid, OS.FILLED, timeout_s=10)
+
+        # Submit stop far below market
+        stop_oid = broker.submit_stop_order(
+            symbol="SPY",
+            quantity=Decimal("1"),
+            side=BrokerOrderSide.SELL,
+            stop_price=Decimal("50.00"),
+            internal_order_id=_uid(),
+        )
+        assert stop_oid, "stop order must return a broker_order_id"
+
+        time.sleep(1)
+        status, _ = broker.get_order_status(stop_oid)
+        assert status in (OS.SUBMITTED, OS.PENDING, OS.PARTIALLY_FILLED), (
+            f"Expected stop to be accepted, got: {status}"
+        )
+
+        # Cleanup: cancel stop, sell position
+        try:
+            broker.cancel_order(stop_oid)
+            time.sleep(1)
+            broker.submit_market_order(
+                symbol="SPY", quantity=Decimal("1"),
+                side=BrokerOrderSide.SELL,
+                internal_order_id=_uid(),
+            )
+            time.sleep(2)
+        except Exception:
+            pass
+
+    @pytest.mark.skipif(not _market_is_open(), reason=_MARKET_CLOSED_REASON)
+    def test_restart_reconciliation_detects_position(self, broker):
         """
         GIVEN: A filled BUY position exists at the broker
         WHEN:  We create a fresh PositionStore + reconciler (simulating restart)
         THEN:  reconcile_startup() detects the broker position and returns
                a discrepancy indicating the local store is missing it.
         """
+        from core.brokers.alpaca_connector import BrokerOrderSide
+        from core.state.order_machine import OrderStatus as OS
         from core.state.position_store import PositionStore
         from core.state.reconciler import StartupReconciler
 
         # 1. Open a real position at the broker
-        order = broker.submit_order(
+        entry_oid = broker.submit_market_order(
             symbol="SPY",
-            qty=1,
-            side="buy",
-            order_type="market",
-            time_in_force="day",
+            quantity=Decimal("1"),
+            side=BrokerOrderSide.BUY,
+            internal_order_id=_uid(),
         )
-        order_id = getattr(order, "id", None) or order.get("id")
-        for _ in range(10):
-            time.sleep(1)
-            status = broker.get_order_status(order_id)
-            if status == "filled":
-                break
-        assert status == "filled", f"Setup: expected filled, got {status}"
+        status, _ = _wait_for_status(broker, entry_oid, OS.FILLED, timeout_s=10)
+        assert status == OS.FILLED, f"Setup: expected filled, got {status}"
 
-        # 2. Create an EMPTY local position store (simulating restart with clean state)
+        # 2. Create an EMPTY local position store (simulating restart)
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
             ps = PositionStore(
                 db_path=os.path.join(tmpdir, "positions.db"),
             )
 
-            # Minimal order tracker stub
             class _StubTracker:
                 def get_open_orders(self, symbol=None):
                     return []
@@ -236,17 +275,17 @@ class TestPaperTruth:
             )
 
             discrepancies = reconciler.reconcile_startup()
-            # Must detect at least one discrepancy: broker has SPY, local doesn't
             spy_discs = [d for d in discrepancies if getattr(d, "symbol", "") == "SPY"]
             assert len(spy_discs) > 0, (
                 f"Expected discrepancy for SPY, got: {discrepancies}"
             )
 
-        # 3. Cleanup: sell the position
+        # 3. Cleanup: sell position
         try:
-            broker.submit_order(
-                symbol="SPY", qty=1, side="sell",
-                order_type="market", time_in_force="day",
+            broker.submit_market_order(
+                symbol="SPY", quantity=Decimal("1"),
+                side=BrokerOrderSide.SELL,
+                internal_order_id=_uid(),
             )
             time.sleep(2)
         except Exception:
