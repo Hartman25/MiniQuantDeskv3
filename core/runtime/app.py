@@ -139,7 +139,6 @@ def _resolve_alpaca_credentials(cfg: Any) -> tuple[str, str]:
     return api_key, api_secret
 
 
-
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -418,6 +417,56 @@ def _emit_auto_heal_event(
     )
 
 
+def _market_hours_should_block(*, broker: Any, opts_mode: str) -> tuple[bool, dict]:
+    """
+    Phase 1 paper-validation integrity guard.
+
+    If Alpaca market is closed, BLOCK order submission so a signal generated
+    overnight does not queue a DAY order to fill at the next open with stale context.
+
+    IMPORTANT TEST BEHAVIOR:
+      - If the broker does NOT implement clock access (e.g. fakes/mocks in tests),
+        we FAIL-OPEN (do not block). Otherwise tests that simulate fills would break.
+
+    Behavior:
+      - Default: FAIL-CLOSED only when clock API exists but is unavailable.
+      - Set MQD_FAIL_OPEN_MARKET_HOURS=1 to fail-open even when clock API errors.
+      - Set MQD_DISABLE_MARKET_HOURS_GUARD=1 to disable entirely.
+      - Cache clock reads inside broker (if broker implements get_clock_info()).
+
+    Returns: (should_block, clock_info_dict)
+    """
+    if os.getenv("MQD_DISABLE_MARKET_HOURS_GUARD", "").strip().lower() in ("1", "true", "yes"):
+        return (False, {})
+
+    if opts_mode not in ("paper", "live"):
+        return (False, {})
+
+    # ✅ If broker doesn't expose clock info (common in fakes/mocks), don't block.
+    if not hasattr(broker, "get_clock_info"):
+        return (False, {})
+
+    fail_open = os.getenv("MQD_FAIL_OPEN_MARKET_HOURS", "").strip().lower() in ("1", "true", "yes")
+
+    try:
+        info = broker.get_clock_info(
+            max_age_s=int(os.getenv("MARKET_CLOCK_CACHE_S", "15") or "15")
+        ) or {}
+
+        # If the broker has clock support but returned nothing, default to safety.
+        if not info:
+            return ((not fail_open), {})
+
+        is_open = bool(info.get("is_open", False))
+        if not is_open:
+            return (True, info)
+
+        return (False, info)
+
+    except Exception:
+        # Clock API exists but errored: fail-closed by default, configurable to fail-open.
+        return ((not fail_open), {})
+
 @dataclass
 class RunOptions:
     config_path: Path
@@ -542,6 +591,7 @@ def _synthetic_bar(symbol: str) -> MarketDataContract:
         provider="synthetic",
     )
 
+
 def _assert_phase1_invariants(*, paper: bool) -> None:
     """
     PATCH 1 — Phase-1 containment guard.
@@ -587,6 +637,7 @@ def _assert_phase1_invariants(*, paper: bool) -> None:
                 )
             except Exception:
                 pass
+
 
 def run(opts: RunOptions) -> int:
     container = Container()
@@ -642,11 +693,20 @@ def run(opts: RunOptions) -> int:
 
     # Start services
     container.start()
+    # Keep a reference for clean shutdown (SQLite handles, etc.)
+    try:
+        if hasattr(container, "get_position_store"):
+            position_store = container.get_position_store()
+    except Exception:
+        pass
+
     journal_dir = Path(os.getenv("JOURNAL_DIR", "data/journal"))
     journal = JournalWriter(base_dir=journal_dir)
     journal.write_event({"event": "boot", "mode": opts.mode, "paper": paper})
     trade_journal = TradeJournal(base_dir=journal_dir)
     trade_run_id = TradeJournal.new_run_id()
+
+    position_store = None  # <-- keep reference for shutdown close()
 
     try:
         protections = container.get_protections()
@@ -857,8 +917,9 @@ def run(opts: RunOptions) -> int:
                         "ts_utc": _utc_iso(),
                     },
                 )
-                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1","true","yes"):
+                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1", "true", "yes"):
                     print(f"[heartbeat] mode={opts.mode} cycle={cycle_count} ts_utc={_utc_iso()}")
+
                 acct = broker.get_account_info()
                 account_value = _safe_decimal(acct.get("portfolio_value", "0"))
                 buying_power = _safe_decimal(acct.get("buying_power", "0"))
@@ -894,7 +955,7 @@ def run(opts: RunOptions) -> int:
                                             "reason": "no_closed_bars_available",
                                         }
                                     )
-                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1","true","yes"):
+                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1", "true", "yes"):
                                         print(f"[data] {symbol}: no_closed_bars_available (market likely closed)")
                                     continue
 
@@ -914,6 +975,7 @@ def run(opts: RunOptions) -> int:
                             journal.write_event({"event": "market_data_error", "symbol": symbol, "error": str(e)})
                             logger.exception("Market data error; skipping symbol", extra={"symbol": symbol})
                             continue
+
                     # ---- validation (skip/soften in harness mode) ----
                     try:
                         if isinstance(data_validator, DataValidator):
@@ -967,8 +1029,11 @@ def run(opts: RunOptions) -> int:
                             continue
 
                         sig_limit = sig.get("limit_price")
-                        sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(str(sig.get("price", getattr(bar, "close", Decimal("0")))))
+                        sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(
+                            str(sig.get("price", getattr(bar, "close", Decimal("0"))))
+                        )
                         sig_strategy = sig.get("strategy", "UNKNOWN")
+
                         if not _is_exit_signal(sig):
                             try:
                                 open_orders = []
@@ -1030,6 +1095,7 @@ def run(opts: RunOptions) -> int:
                                     "reason": f"guard_error:{type(e).__name__}",
                                 })
                                 continue
+
                         key = _cooldown_key(sig_strategy, sig_symbol, side_str)
                         now_ts = time.time()
                         last_ts = last_action_ts.get(key, 0.0)
@@ -1186,6 +1252,33 @@ def run(opts: RunOptions) -> int:
                                     logger.warning("Failed cancelling protective stop", exc_info=True)
                                 protective_stop_ids.pop(sig_symbol, None)
 
+                        # ===============================================================
+                        # PHASE 1 FIX (Audit RISK 1): Market-hours guard BEFORE submission
+                        # ===============================================================
+                        should_block, clock_info = _market_hours_should_block(broker=broker, opts_mode=opts.mode)
+                        if should_block:
+                            journal.write_event(
+                                {
+                                    "event": "market_closed_block",
+                                    "ts_utc": _utc_iso(),
+                                    "trade_id": trade_id,
+                                    "strategy": sig_strategy,
+                                    "symbol": sig_symbol,
+                                    "side": side_str,
+                                    "qty": str(qty),
+                                    "reason": "alpaca_clock_is_open_false_or_clock_unavailable",
+                                    "clock": clock_info,
+                                }
+                            )
+                            logger.info(
+                                "MARKET_CLOSED_BLOCK: %s %s qty=%s next_open=%s",
+                                sig_symbol,
+                                side_str,
+                                str(qty),
+                                (clock_info.get("next_open") if isinstance(clock_info, dict) else None),
+                            )
+                            continue
+
                         internal_id = f"{sig_strategy}-{uuid.uuid4().hex[:10]}"
 
                         # PATCH 2: link signal trade_id to engine so journal
@@ -1321,6 +1414,32 @@ def run(opts: RunOptions) -> int:
                                 if fill_info:
                                     filled_qty = fill_info.get("filled_qty")
                                     fill_price = fill_info.get("filled_avg_price")
+                                    # Phase 1.5 visibility: estimate paper slippage/spread friction (does not change fills)
+                                    if opts.mode == "paper":
+                                        try:
+                                            bps = Decimal(str(os.getenv("PAPER_SLIPPAGE_WARN_BPS", "5")))
+                                            if bps > 0 and fill_price is not None:
+                                                notional = _safe_decimal(fill_price) * _safe_decimal(qty)
+                                                est_cost = (notional * bps / Decimal("10000")).quantize(Decimal("0.01"))
+                                                journal.write_event({
+                                                    "event": "paper_slippage_estimate",
+                                                    "ts_utc": _utc_iso(),
+                                                    "trade_id": trade_id,
+                                                    "symbol": sig_symbol,
+                                                    "side": side_str,
+                                                    "qty": str(qty),
+                                                    "fill_price": str(fill_price),
+                                                    "bps": str(bps),
+                                                    "notional": str(notional),
+                                                    "estimated_cost": str(est_cost),
+                                                })
+                                                logger.info(
+                                                    "PAPER_SLIPPAGE_ESTIMATE: %s %s qty=%s bps=%s est_cost=%s",
+                                                    sig_symbol, side_str, str(qty), str(bps), str(est_cost),
+                                                )
+                                        except Exception:
+                                            logger.debug("Paper slippage estimate failed", exc_info=True)
+
                             except Exception:
                                 pass
 
@@ -1425,6 +1544,7 @@ def run(opts: RunOptions) -> int:
                                     position_store.delete(sig_symbol)
                             except Exception:
                                 logger.warning("PositionStore update failed", exc_info=True)
+
                 cycle_count += 1
                 orphan_counter += 1
                 if orphan_counter >= orphan_check_interval:
@@ -1451,6 +1571,7 @@ def run(opts: RunOptions) -> int:
                             logger.info("Orphan check: No drift detected")
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
+
                 # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()
 
@@ -1463,7 +1584,6 @@ def run(opts: RunOptions) -> int:
                             time.sleep(opts.run_interval_s)
                         except KeyboardInterrupt:
                             return 0
-
                     except KeyboardInterrupt:
                         state.running = False
                         break
@@ -1504,6 +1624,18 @@ def run(opts: RunOptions) -> int:
 
         try:
             trade_journal.close()
+        except Exception:
+            pass
+
+        # ===============================================================
+        # PHASE 1 FIX (Audit RISK 5): Close PositionStore SQLite handles
+        # ===============================================================
+        try:
+            ps = position_store
+            if ps is None:
+                ps = container.get_position_store() if hasattr(container, "get_position_store") else None
+            if ps is not None and hasattr(ps, "close"):
+                ps.close()
         except Exception:
             pass
 
