@@ -9,12 +9,6 @@ from core.runtime.app import RunOptions, run
 
 from core.config.env import load_env
 
-loaded = load_env()
-if loaded:
-    print(f"[env] loaded: {', '.join(str(p) for p in loaded) or 'none'}")
-else:
-    print("[env] no .env files loaded")
-
 # ----------------------------
 # CLI / Smoke helpers
 # ----------------------------
@@ -100,6 +94,13 @@ def run_paper(*, config_path: Path, run_interval_s: int = 60, run_once: bool = F
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load .env files (moved from module level to avoid import-time side effects)
+    loaded = load_env()
+    if loaded:
+        print(f"[env] loaded: {', '.join(str(p) for p in loaded) or 'none'}")
+    else:
+        print("[env] no .env files loaded")
+
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
     cfg_path: Path = args.config.expanduser().resolve()

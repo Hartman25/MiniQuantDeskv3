@@ -30,6 +30,8 @@ from alpaca.common.exceptions import APIError
 from core.logging import get_logger, LogStream, LogContext
 from core.state import OrderStatus, Position
 
+from datetime import timezone
+
 
 # ============================================================================
 # BROKER ORDER SIDE
@@ -74,19 +76,26 @@ class AlpacaBrokerConnector:
         self.api_secret = api_secret
         self.paper = paper
         self.logger = get_logger(LogStream.TRADING)
-        
+
         self.client = TradingClient(
             api_key=api_key,
             secret_key=api_secret,
             paper=paper
         )
-        
+
         self._order_id_map: Dict[str, str] = {}
-        
+
+        # Clock TTL cache — avoid hammering /v2/clock every cycle
+        self._clock_cache: Optional[Dict] = None
+        self._clock_cache_ts: float = 0.0
+        self._clock_cache_ttl: float = float(
+            os.getenv("MARKET_CLOCK_CACHE_S", "15") or "15"
+        )
+
         self.logger.info("AlpacaBrokerConnector initialized", extra={
             "paper_trading": self.paper
         })
-        
+
         self._verify_account()
 
     def _ensure_orders_allowed(self) -> None:
@@ -259,22 +268,78 @@ class AlpacaBrokerConnector:
         except Exception as e:
             raise BrokerConnectionError(f"Failed to get orders: {e}")
     
+    def get_clock(self) -> Dict:
+        """Query the Alpaca clock API for market status and next open/close.
+
+        Results are cached for ``MARKET_CLOCK_CACHE_S`` seconds (default 15)
+        to avoid hammering /v2/clock on every cycle/signal.
+
+        Returns a dict with keys:
+            is_open (bool), timestamp (datetime), next_open (datetime),
+            next_close (datetime).
+
+        Raises BrokerConnectionError on failure.
+        """
+        now_mono = time.monotonic()
+        if (
+            self._clock_cache is not None
+            and (now_mono - self._clock_cache_ts) < self._clock_cache_ttl
+        ):
+            return self._clock_cache
+
+        try:
+            clock = self._retry_api_call(lambda: self.client.get_clock())
+            # Alpaca SDK returns an object with attrs; normalise to dict.
+            result = {
+                "is_open": bool(clock.is_open),
+                "timestamp": clock.timestamp.astimezone(timezone.utc) if clock.timestamp else None,
+                "next_open": clock.next_open.astimezone(timezone.utc) if clock.next_open else None,
+                "next_close": clock.next_close.astimezone(timezone.utc) if clock.next_close else None,
+            }
+            self._clock_cache = result
+            self._clock_cache_ts = now_mono
+            return result
+        except Exception as e:
+            raise BrokerConnectionError(f"Failed to get market clock: {e}")
+
+    # Network-level errors that are always safe to retry (transient by nature).
+    _RETRYABLE_NETWORK_ERRORS = (ConnectionError, TimeoutError, OSError)
+
     def _retry_api_call(self, func, max_retries: Optional[int] = None):
-        """Retry with exponential backoff."""
+        """Retry with exponential backoff.
+
+        Retries on:
+          - HTTP 429 (rate limit) and 5xx (server errors) via ``APIError``
+          - ``ConnectionError``, ``TimeoutError``, ``OSError`` (network transients)
+        """
         max_retries = max_retries or self.MAX_RETRIES
         delay = self.RETRY_DELAY_SECONDS
-        
+
         for attempt in range(max_retries):
             try:
                 return func()
             except APIError as e:
                 status_code = getattr(e, 'status_code', None)
-                
+
                 if status_code == 429 or (status_code and 500 <= status_code < 600):
                     if attempt < max_retries - 1:
+                        self.logger.warning(
+                            "Retryable API error (attempt %d/%d): %s",
+                            attempt + 1, max_retries, e,
+                        )
                         time.sleep(delay)
                         delay *= self.RETRY_BACKOFF_MULTIPLIER
                         continue
+                raise
+            except self._RETRYABLE_NETWORK_ERRORS as e:
+                if attempt < max_retries - 1:
+                    self.logger.warning(
+                        "Retryable network error (attempt %d/%d): %s: %s",
+                        attempt + 1, max_retries, type(e).__name__, e,
+                    )
+                    time.sleep(delay)
+                    delay *= self.RETRY_BACKOFF_MULTIPLIER
+                    continue
                 raise
     
     def _map_status(self, alpaca_status: str) -> OrderStatus:

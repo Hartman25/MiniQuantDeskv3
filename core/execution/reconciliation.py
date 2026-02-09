@@ -1,6 +1,17 @@
 """
 Position reconciliation - syncs local state with broker state.
 
+╔══════════════════════════════════════════════════════════════════╗
+║  DEPRECATED – Phase 1 legacy module.                           ║
+║                                                                ║
+║  This module is NOT used in the production runtime loop.       ║
+║  The active reconciler lives at:                               ║
+║      core/state/reconciler.py                                  ║
+║                                                                ║
+║  Kept for reference / tests only.  Do NOT add new callers.     ║
+║  Scheduled for removal in Phase 3.                             ║
+╚══════════════════════════════════════════════════════════════════╝
+
 CRITICAL PROPERTIES:
 1. Detects position drift (local vs broker)
 2. Reconciles on startup
