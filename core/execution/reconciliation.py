@@ -1,6 +1,17 @@
 """
 Position reconciliation - syncs local state with broker state.
 
+╔══════════════════════════════════════════════════════════════════╗
+║  DEPRECATED – Phase 1 legacy module.                           ║
+║                                                                ║
+║  This module is NOT used in the production runtime loop.       ║
+║  The active reconciler lives at:                               ║
+║      core/state/reconciler.py                                  ║
+║                                                                ║
+║  Kept for reference / tests only.  Do NOT add new callers.     ║
+║  Scheduled for removal in Phase 3.                             ║
+╚══════════════════════════════════════════════════════════════════╝
+
 CRITICAL PROPERTIES:
 1. Detects position drift (local vs broker)
 2. Reconciles on startup
@@ -10,33 +21,6 @@ CRITICAL PROPERTIES:
 
 Based on defensive programming - trust broker as source of truth.
 """
-
-from __future__ import annotations
-
-# NOTE: This module is intentionally NOT wired into the active runtime.
-# It is kept for reference only. Importing it should be harmless.
-_DEPRECATED_WARNING_EMITTED = False
-
-def _warn_deprecated() -> None:
-    """Emit a deprecation warning the first time this module is *used*.
-
-    We avoid warning at import-time because some environments treat warnings
-    as errors (or spam logs) during test collection.
-    """
-    global _DEPRECATED_WARNING_EMITTED
-    if _DEPRECATED_WARNING_EMITTED:
-        return
-    _DEPRECATED_WARNING_EMITTED = True
-    try:
-        import warnings
-        warnings.warn(
-            "core.execution.reconciliation is deprecated/unused; use core.state.reconciler instead.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-    except Exception:
-        # Never fail because a warning couldn't be emitted.
-        pass
 
 from typing import List, Dict, Tuple
 from decimal import Decimal
@@ -116,8 +100,6 @@ class PositionReconciliation:
         self.logger.info("PositionReconciliation initialized")
     
     def reconcile(self) -> ReconciliationResult:
-    
-        _warn_deprecated()
         """
         Reconcile positions between local store and broker.
         

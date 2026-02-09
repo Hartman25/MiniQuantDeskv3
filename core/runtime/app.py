@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple  # FIX: added Any
 
 import pandas as pd
 
-from core.brokers import AlpacaBrokerConnector, BrokerOrderSide
+from core.brokers import AlpacaBrokerConnector, BrokerOrderSide, BrokerConnectionError
 from core.runtime.circuit_breaker import ConsecutiveFailureBreaker
 from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus
 from core.recovery.persistence import StatePersistence
@@ -137,6 +137,7 @@ def _resolve_alpaca_credentials(cfg: Any) -> tuple[str, str]:
         )
 
     return api_key, api_secret
+
 
 
 def _utc_iso() -> str:
@@ -417,56 +418,6 @@ def _emit_auto_heal_event(
     )
 
 
-def _market_hours_should_block(*, broker: Any, opts_mode: str) -> tuple[bool, dict]:
-    """
-    Phase 1 paper-validation integrity guard.
-
-    If Alpaca market is closed, BLOCK order submission so a signal generated
-    overnight does not queue a DAY order to fill at the next open with stale context.
-
-    IMPORTANT TEST BEHAVIOR:
-      - If the broker does NOT implement clock access (e.g. fakes/mocks in tests),
-        we FAIL-OPEN (do not block). Otherwise tests that simulate fills would break.
-
-    Behavior:
-      - Default: FAIL-CLOSED only when clock API exists but is unavailable.
-      - Set MQD_FAIL_OPEN_MARKET_HOURS=1 to fail-open even when clock API errors.
-      - Set MQD_DISABLE_MARKET_HOURS_GUARD=1 to disable entirely.
-      - Cache clock reads inside broker (if broker implements get_clock_info()).
-
-    Returns: (should_block, clock_info_dict)
-    """
-    if os.getenv("MQD_DISABLE_MARKET_HOURS_GUARD", "").strip().lower() in ("1", "true", "yes"):
-        return (False, {})
-
-    if opts_mode not in ("paper", "live"):
-        return (False, {})
-
-    # ✅ If broker doesn't expose clock info (common in fakes/mocks), don't block.
-    if not hasattr(broker, "get_clock_info"):
-        return (False, {})
-
-    fail_open = os.getenv("MQD_FAIL_OPEN_MARKET_HOURS", "").strip().lower() in ("1", "true", "yes")
-
-    try:
-        info = broker.get_clock_info(
-            max_age_s=int(os.getenv("MARKET_CLOCK_CACHE_S", "15") or "15")
-        ) or {}
-
-        # If the broker has clock support but returned nothing, default to safety.
-        if not info:
-            return ((not fail_open), {})
-
-        is_open = bool(info.get("is_open", False))
-        if not is_open:
-            return (True, info)
-
-        return (False, info)
-
-    except Exception:
-        # Clock API exists but errored: fail-closed by default, configurable to fail-open.
-        return ((not fail_open), {})
-
 @dataclass
 class RunOptions:
     config_path: Path
@@ -591,7 +542,6 @@ def _synthetic_bar(symbol: str) -> MarketDataContract:
         provider="synthetic",
     )
 
-
 def _assert_phase1_invariants(*, paper: bool) -> None:
     """
     PATCH 1 — Phase-1 containment guard.
@@ -637,6 +587,90 @@ def _assert_phase1_invariants(*, paper: bool) -> None:
                 )
             except Exception:
                 pass
+
+def _check_market_open(broker, *, fail_open_env: str = "MQD_FAIL_OPEN_MARKET_HOURS") -> dict:
+    """Query the broker clock for market-open status.
+
+    Returns a dict:
+        {"is_open": bool, "next_open": datetime|None, "next_close": datetime|None,
+         "source": "broker"|"fallback", "error": str|None}
+
+    Behaviour on error is controlled by the env var *fail_open_env*:
+        - If set to a truthy value ("1"/"true"/"yes") → fail-open (return is_open=True).
+        - Otherwise → fail-closed (return is_open=False).  Default for production.
+    In unit-test fakes that don't implement ``get_clock``, we always fail-open so
+    tests that don't care about market hours keep working.
+    """
+    has_clock = hasattr(broker, "get_clock") and callable(getattr(broker, "get_clock"))
+
+    if not has_clock:
+        # Fake/test broker without clock support → fail-open
+        return {
+            "is_open": True,
+            "next_open": None,
+            "next_close": None,
+            "source": "fallback",
+            "error": "broker_has_no_clock",
+        }
+
+    try:
+        clock = broker.get_clock()
+        return {
+            "is_open": bool(clock.get("is_open", False)),
+            "next_open": clock.get("next_open"),
+            "next_close": clock.get("next_close"),
+            "source": "broker",
+            "error": None,
+        }
+    except Exception as exc:
+        fail_open = os.getenv(fail_open_env, "").strip().lower() in ("1", "true", "yes")
+        return {
+            "is_open": fail_open,
+            "next_open": None,
+            "next_close": None,
+            "source": "fallback",
+            "error": str(exc),
+        }
+
+
+def compute_adaptive_sleep(
+    *,
+    market_is_open: bool,
+    next_open_utc: Optional[datetime] = None,
+    now_utc: Optional[datetime] = None,
+    base_interval_s: int = 60,
+    closed_interval_s: int = 0,
+    pre_open_interval_s: int = 0,
+    pre_open_window_m: int = 0,
+) -> int:
+    """Return the number of seconds to sleep before the next cycle.
+
+    Config-driven via env vars (resolved at call site):
+        MQD_CLOSED_SLEEP_S   – sleep when market closed (default 120)
+        MQD_PREOPEN_SLEEP_S  – sleep within pre-open window (default 20)
+        MQD_PREOPEN_WINDOW_M – minutes before open to switch to short sleep (default 10)
+
+    Args:
+        now_utc: Current UTC time.  Injected for testability — if None,
+                 falls back to ``datetime.now(timezone.utc)``.
+
+    Pure function – no side effects – easily unit-testable.
+    """
+    closed_interval_s = closed_interval_s or 120
+    pre_open_interval_s = pre_open_interval_s or 20
+    pre_open_window_m = pre_open_window_m or 10
+
+    if market_is_open:
+        return max(1, base_interval_s)
+
+    # Market is closed
+    if next_open_utc is not None:
+        now = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        seconds_to_open = (next_open_utc - now).total_seconds()
+        if 0 < seconds_to_open <= pre_open_window_m * 60:
+            return max(1, pre_open_interval_s)
+
+    return max(1, closed_interval_s)
 
 
 def run(opts: RunOptions) -> int:
@@ -693,20 +727,11 @@ def run(opts: RunOptions) -> int:
 
     # Start services
     container.start()
-    # Keep a reference for clean shutdown (SQLite handles, etc.)
-    try:
-        if hasattr(container, "get_position_store"):
-            position_store = container.get_position_store()
-    except Exception:
-        pass
-
     journal_dir = Path(os.getenv("JOURNAL_DIR", "data/journal"))
     journal = JournalWriter(base_dir=journal_dir)
     journal.write_event({"event": "boot", "mode": opts.mode, "paper": paper})
     trade_journal = TradeJournal(base_dir=journal_dir)
     trade_run_id = TradeJournal.new_run_id()
-
-    position_store = None  # <-- keep reference for shutdown close()
 
     try:
         protections = container.get_protections()
@@ -906,6 +931,44 @@ def run(opts: RunOptions) -> int:
         _max_consecutive = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5") or "5")
         _circuit_breaker = ConsecutiveFailureBreaker(max_failures=_max_consecutive)
 
+        # ===============================================================
+        # OPERATIONAL READINESS: adaptive sleep + market-hours config
+        # ===============================================================
+        _closed_sleep_s = int(os.getenv("MQD_CLOSED_SLEEP_S", "120") or "120")
+        _preopen_sleep_s = int(os.getenv("MQD_PREOPEN_SLEEP_S", "20") or "20")
+        _preopen_window_m = int(os.getenv("MQD_PREOPEN_WINDOW_M", "10") or "10")
+
+        import pytz as _pytz
+        _ny_tz = _pytz.timezone("America/New_York")
+
+        def _ny_now_str() -> str:
+            return datetime.now(timezone.utc).astimezone(_ny_tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+        # Startup configuration summary
+        _fail_open_env_val = os.getenv("MQD_FAIL_OPEN_MARKET_HOURS", "0").strip()
+        journal.write_event({
+            "event": "startup_config_summary",
+            "ts_utc": _utc_iso(),
+            "ts_ny": _ny_now_str(),
+            "run_id": trade_run_id,
+            "mode": opts.mode,
+            "paper": paper,
+            "symbols": all_symbols,
+            "cycle_interval_s": opts.run_interval_s,
+            "closed_sleep_s": _closed_sleep_s,
+            "preopen_sleep_s": _preopen_sleep_s,
+            "preopen_window_m": _preopen_window_m,
+            "max_consecutive_failures": _max_consecutive,
+            "cooldown_s": cooldown_s,
+            "config_path": str(opts.config_path),
+            "guard_fail_open": _fail_open_env_val.lower() in ("1", "true", "yes"),
+            "clock_cache_ttl_s": os.getenv("MARKET_CLOCK_CACHE_S", "15"),
+        })
+        logger.info(
+            "STARTUP CONFIG: mode=%s paper=%s symbols=%s interval=%ds closed_sleep=%ds",
+            opts.mode, paper, all_symbols, opts.run_interval_s, _closed_sleep_s,
+        )
+
         while state.running:
             try:
                 logger.info(
@@ -917,8 +980,58 @@ def run(opts: RunOptions) -> int:
                         "ts_utc": _utc_iso(),
                     },
                 )
-                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1", "true", "yes"):
-                    print(f"[heartbeat] mode={opts.mode} cycle={cycle_count} ts_utc={_utc_iso()}")
+                if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1","true","yes"):
+                    print(f"[heartbeat] mode={opts.mode} cycle={cycle_count} ts_utc={_utc_iso()} ts_ny={_ny_now_str()}")
+
+                # ===============================================================
+                # MARKET-HOURS GUARD: skip order processing when market is closed
+                # ===============================================================
+                _market_status = _check_market_open(broker)
+                _market_is_open = _market_status["is_open"]
+
+                if not _market_is_open:
+                    _next_open = _market_status.get("next_open")
+                    _next_close = _market_status.get("next_close")
+                    _next_open_str = _next_open.astimezone(_ny_tz).strftime("%Y-%m-%d %H:%M:%S %Z") if _next_open else "unknown"
+                    journal.write_event({
+                        "event": "MARKET_CLOSED_BLOCK",
+                        "ts_utc": _utc_iso(),
+                        "ts_ny": _ny_now_str(),
+                        "run_id": trade_run_id,
+                        "next_open_utc": _next_open.isoformat() if _next_open else None,
+                        "next_open_ny": _next_open_str,
+                        "next_close_utc": _next_close.isoformat() if _next_close else None,
+                        "source": _market_status["source"],
+                        "error": _market_status.get("error"),
+                        "symbols": all_symbols,
+                    })
+                    logger.info(
+                        "MARKET_CLOSED_BLOCK: market is closed, next open=%s (source=%s)",
+                        _next_open_str, _market_status["source"],
+                    )
+                    if os.getenv("HEARTBEAT_PRINT", "1").strip().lower() in ("1","true","yes"):
+                        print(f"[market_closed] next_open={_next_open_str} source={_market_status['source']}")
+
+                    # Adaptive sleep: sleep longer when closed, shorter near open
+                    _sleep_s = compute_adaptive_sleep(
+                        market_is_open=False,
+                        next_open_utc=_next_open,
+                        now_utc=datetime.now(timezone.utc),
+                        base_interval_s=opts.run_interval_s,
+                        closed_interval_s=_closed_sleep_s,
+                        pre_open_interval_s=_preopen_sleep_s,
+                        pre_open_window_m=_preopen_window_m,
+                    )
+                    cycle_count += 1
+                    _circuit_breaker.record_success()  # closed-market cycles are not failures
+                    if opts.run_once:
+                        state.running = False
+                        break
+                    try:
+                        time.sleep(_sleep_s)
+                    except KeyboardInterrupt:
+                        return 0
+                    continue  # Skip all order processing this cycle
 
                 acct = broker.get_account_info()
                 account_value = _safe_decimal(acct.get("portfolio_value", "0"))
@@ -955,7 +1068,7 @@ def run(opts: RunOptions) -> int:
                                             "reason": "no_closed_bars_available",
                                         }
                                     )
-                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1", "true", "yes"):
+                                    if os.getenv("DATA_PRINT", "1").strip().lower() in ("1","true","yes"):
                                         print(f"[data] {symbol}: no_closed_bars_available (market likely closed)")
                                     continue
 
@@ -975,7 +1088,6 @@ def run(opts: RunOptions) -> int:
                             journal.write_event({"event": "market_data_error", "symbol": symbol, "error": str(e)})
                             logger.exception("Market data error; skipping symbol", extra={"symbol": symbol})
                             continue
-
                     # ---- validation (skip/soften in harness mode) ----
                     try:
                         if isinstance(data_validator, DataValidator):
@@ -1029,11 +1141,8 @@ def run(opts: RunOptions) -> int:
                             continue
 
                         sig_limit = sig.get("limit_price")
-                        sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(
-                            str(sig.get("price", getattr(bar, "close", Decimal("0"))))
-                        )
+                        sig_price = Decimal(str(sig_limit)) if sig_limit is not None else Decimal(str(sig.get("price", getattr(bar, "close", Decimal("0")))))
                         sig_strategy = sig.get("strategy", "UNKNOWN")
-
                         if not _is_exit_signal(sig):
                             try:
                                 open_orders = []
@@ -1095,7 +1204,6 @@ def run(opts: RunOptions) -> int:
                                     "reason": f"guard_error:{type(e).__name__}",
                                 })
                                 continue
-
                         key = _cooldown_key(sig_strategy, sig_symbol, side_str)
                         now_ts = time.time()
                         last_ts = last_action_ts.get(key, 0.0)
@@ -1252,33 +1360,6 @@ def run(opts: RunOptions) -> int:
                                     logger.warning("Failed cancelling protective stop", exc_info=True)
                                 protective_stop_ids.pop(sig_symbol, None)
 
-                        # ===============================================================
-                        # PHASE 1 FIX (Audit RISK 1): Market-hours guard BEFORE submission
-                        # ===============================================================
-                        should_block, clock_info = _market_hours_should_block(broker=broker, opts_mode=opts.mode)
-                        if should_block:
-                            journal.write_event(
-                                {
-                                    "event": "market_closed_block",
-                                    "ts_utc": _utc_iso(),
-                                    "trade_id": trade_id,
-                                    "strategy": sig_strategy,
-                                    "symbol": sig_symbol,
-                                    "side": side_str,
-                                    "qty": str(qty),
-                                    "reason": "alpaca_clock_is_open_false_or_clock_unavailable",
-                                    "clock": clock_info,
-                                }
-                            )
-                            logger.info(
-                                "MARKET_CLOSED_BLOCK: %s %s qty=%s next_open=%s",
-                                sig_symbol,
-                                side_str,
-                                str(qty),
-                                (clock_info.get("next_open") if isinstance(clock_info, dict) else None),
-                            )
-                            continue
-
                         internal_id = f"{sig_strategy}-{uuid.uuid4().hex[:10]}"
 
                         # PATCH 2: link signal trade_id to engine so journal
@@ -1414,32 +1495,6 @@ def run(opts: RunOptions) -> int:
                                 if fill_info:
                                     filled_qty = fill_info.get("filled_qty")
                                     fill_price = fill_info.get("filled_avg_price")
-                                    # Phase 1.5 visibility: estimate paper slippage/spread friction (does not change fills)
-                                    if opts.mode == "paper":
-                                        try:
-                                            bps = Decimal(str(os.getenv("PAPER_SLIPPAGE_WARN_BPS", "5")))
-                                            if bps > 0 and fill_price is not None:
-                                                notional = _safe_decimal(fill_price) * _safe_decimal(qty)
-                                                est_cost = (notional * bps / Decimal("10000")).quantize(Decimal("0.01"))
-                                                journal.write_event({
-                                                    "event": "paper_slippage_estimate",
-                                                    "ts_utc": _utc_iso(),
-                                                    "trade_id": trade_id,
-                                                    "symbol": sig_symbol,
-                                                    "side": side_str,
-                                                    "qty": str(qty),
-                                                    "fill_price": str(fill_price),
-                                                    "bps": str(bps),
-                                                    "notional": str(notional),
-                                                    "estimated_cost": str(est_cost),
-                                                })
-                                                logger.info(
-                                                    "PAPER_SLIPPAGE_ESTIMATE: %s %s qty=%s bps=%s est_cost=%s",
-                                                    sig_symbol, side_str, str(qty), str(bps), str(est_cost),
-                                                )
-                                        except Exception:
-                                            logger.debug("Paper slippage estimate failed", exc_info=True)
-
                             except Exception:
                                 pass
 
@@ -1544,7 +1599,6 @@ def run(opts: RunOptions) -> int:
                                     position_store.delete(sig_symbol)
                             except Exception:
                                 logger.warning("PositionStore update failed", exc_info=True)
-
                 cycle_count += 1
                 orphan_counter += 1
                 if orphan_counter >= orphan_check_interval:
@@ -1571,7 +1625,6 @@ def run(opts: RunOptions) -> int:
                             logger.info("Orphan check: No drift detected")
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
-
                 # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()
 
@@ -1579,14 +1632,20 @@ def run(opts: RunOptions) -> int:
                     state.running = False
                     break
                 if opts.run_interval_s > 0:
+                    # Adaptive sleep: use base interval when market is open
+                    _sleep_s = compute_adaptive_sleep(
+                        market_is_open=_market_is_open,
+                        next_open_utc=_market_status.get("next_open"),
+                        now_utc=datetime.now(timezone.utc),
+                        base_interval_s=opts.run_interval_s,
+                        closed_interval_s=_closed_sleep_s,
+                        pre_open_interval_s=_preopen_sleep_s,
+                        pre_open_window_m=_preopen_window_m,
+                    )
                     try:
-                        try:
-                            time.sleep(opts.run_interval_s)
-                        except KeyboardInterrupt:
-                            return 0
+                        time.sleep(_sleep_s)
                     except KeyboardInterrupt:
-                        state.running = False
-                        break
+                        return 0
 
             except KeyboardInterrupt:
                 # Smoke-track hardening: Ctrl-C should always exit cleanly (no traceback)
@@ -1594,7 +1653,12 @@ def run(opts: RunOptions) -> int:
 
             except Exception as e:
                 try:
-                    journal.write_event({"event": "runtime_error", "error": str(e)})
+                    journal.write_event({
+                        "event": "runtime_error",
+                        "run_id": trade_run_id,
+                        "error": str(e),
+                        "ts_utc": _utc_iso(),
+                    })
                 except Exception:
                     pass
                 logger.exception(f"Runtime loop error: {e}")
@@ -1605,18 +1669,36 @@ def run(opts: RunOptions) -> int:
                         "CIRCUIT BREAKER TRIPPED: %d consecutive failures – halting",
                         _circuit_breaker.failure_count,
                     )
+                    journal.write_event({
+                        "event": "circuit_breaker_tripped",
+                        "run_id": trade_run_id,
+                        "failure_count": _circuit_breaker.failure_count,
+                        "reason": str(e),
+                        "ts_utc": _utc_iso(),
+                    })
                     return 1
 
                 if opts.run_once:
                     return 1
 
                 if opts.run_interval_s > 0:
-                    time.sleep(opts.run_interval_s)
+                    try:
+                        time.sleep(opts.run_interval_s)
+                    except KeyboardInterrupt:
+                        return 0
 
         logger.info("Runtime loop stopped")
         return 0
 
     finally:
+        # Close PositionStore first (SQLite "database is locked" prevention on Windows)
+        try:
+            _ps = container.get_position_store()
+            if _ps is not None and hasattr(_ps, "close"):
+                _ps.close()
+        except Exception:
+            pass
+
         try:
             container.stop()
         except Exception:
@@ -1624,18 +1706,6 @@ def run(opts: RunOptions) -> int:
 
         try:
             trade_journal.close()
-        except Exception:
-            pass
-
-        # ===============================================================
-        # PHASE 1 FIX (Audit RISK 5): Close PositionStore SQLite handles
-        # ===============================================================
-        try:
-            ps = position_store
-            if ps is None:
-                ps = container.get_position_store() if hasattr(container, "get_position_store") else None
-            if ps is not None and hasattr(ps, "close"):
-                ps.close()
         except Exception:
             pass
 
