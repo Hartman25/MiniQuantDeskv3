@@ -395,19 +395,27 @@ class RecoveryCoordinator:
             )
     
     def _rebuild_position_from_broker(self, broker_pos):
-        """Rebuild position from broker data."""
+        """Rebuild position from broker data.
+
+        ``broker_pos`` may be either a raw Alpaca position object (with
+        ``.qty`` / ``.avg_entry_price``) or a mapped ``Position`` dataclass
+        (with ``.quantity`` / ``.entry_price``).  We accept both.
+        """
         try:
+            qty = getattr(broker_pos, "qty", None) or getattr(broker_pos, "quantity", None)
+            avg = getattr(broker_pos, "avg_entry_price", None) or getattr(broker_pos, "entry_price", None)
+
             self.position_store.restore_position(
                 symbol=broker_pos.symbol,
-                quantity=Decimal(str(broker_pos.qty)),
-                avg_price=Decimal(str(broker_pos.avg_entry_price)),
-                entry_time=datetime.now(timezone.utc)  # Unknown, use current time
+                quantity=Decimal(str(qty)),
+                avg_price=Decimal(str(avg)),
+                entry_time=getattr(broker_pos, "entry_time", None) or datetime.now(timezone.utc),
             )
-            
+
             self.logger.debug(f"Rebuilt position from broker: {broker_pos.symbol}", extra={
                 "symbol": broker_pos.symbol,
-                "quantity": str(broker_pos.qty),
-                "avg_price": str(broker_pos.avg_entry_price)
+                "quantity": str(qty),
+                "avg_price": str(avg),
             })
             
         except Exception as e:
