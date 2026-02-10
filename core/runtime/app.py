@@ -1059,14 +1059,21 @@ def run(opts: RunOptions) -> int:
                         try:
                             df = _get_latest_bars_compat(data_pipeline, symbol, lookback, timeframe)
                             bars = _df_to_contracts(symbol, df)
+                            _diag = os.getenv("PIPELINE_DIAG", "0").strip().lower() in ("1", "true", "yes")
+                            if _diag:
+                                _df_n = len(df) if df is not None and not getattr(df, 'empty', True) else 0
+                                print(f"[DIAG-app] df from pipeline: {_df_n} rows, contracts: {len(bars)}")
 
                             # In PAPER/LIVE, act only on fully closed bars (anti-lookahead).
                             # NOTE: The pipeline already drops incomplete bars via
                             # _drop_incomplete_last_bar, so use grace_period_seconds=0
                             # here to avoid rejecting bars the pipeline deemed complete.
                             if opts.mode in ("paper", "live") and bars and not no_market_data_mode:
+                                _pre = len(bars)
                                 while bars and not bars[-1].is_complete(timeframe, grace_period_seconds=0):
                                     bars.pop()
+                                if _diag and _pre != len(bars):
+                                    print(f"[DIAG-app] is_complete popped {_pre - len(bars)} bars, {len(bars)} remain")
 
                             if not bars:
                                 # In harness mode we can synthesize; in PAPER/LIVE we skip this cycle.

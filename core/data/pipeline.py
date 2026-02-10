@@ -15,6 +15,7 @@ Based on LEAN's DataFeed architecture.
 from typing import Optional, List, Dict
 from decimal import Decimal
 from datetime import datetime, timedelta, timezone
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -156,15 +157,22 @@ class MarketDataPipeline:
         # -----------------
         # Cache path
         # -----------------
+        _diag = os.getenv("PIPELINE_DIAG", "0").strip().lower() in ("1", "true", "yes")
         cached = self._get_from_cache(symbol, timeframe)
         if cached is not None:
             self.logger.debug(f"Cache hit: {symbol} {timeframe}")
+            if _diag:
+                print(f"[DIAG] cache hit {symbol} {timeframe}: {len(cached)} bars, last_ts={cached.index[-1] if not cached.empty else 'EMPTY'}")
 
             # Prevent lookahead on cached path too
             cached = self._drop_incomplete_last_bar(cached, timeframe)
 
             if cached is not None and not cached.empty:
+                if _diag:
+                    print(f"[DIAG] cache returning {len(cached.tail(lookback_bars))} bars for {symbol}")
                 return cached.tail(lookback_bars)
+            elif _diag:
+                print(f"[DIAG] cache empty after drop_incomplete for {symbol}")
 
         # -----------------
         # Provider path
@@ -174,9 +182,18 @@ class MarketDataPipeline:
             fetch_n = max(int(lookback_bars) + 2, 3)
 
             bars_df = self._fetch_from_alpaca(symbol, fetch_n, timeframe)
+            if _diag:
+                _n = len(bars_df) if bars_df is not None and not bars_df.empty else 0
+                _last = bars_df.index[-1] if _n > 0 else "EMPTY"
+                _first = bars_df.index[0] if _n > 0 else "EMPTY"
+                print(f"[DIAG] alpaca returned {_n} bars for {symbol}, range=[{_first} .. {_last}]")
 
             # Prevent lookahead: drop incomplete last bar
             bars_df = self._drop_incomplete_last_bar(bars_df, timeframe)
+            if _diag:
+                _n2 = len(bars_df) if bars_df is not None and not bars_df.empty else 0
+                _last2 = bars_df.index[-1] if _n2 > 0 else "EMPTY"
+                print(f"[DIAG] after drop_incomplete: {_n2} bars, last_ts={_last2}")
 
             # Validate staleness (use close time of last bar, not open time)
             # A bar timestamped 09:30 with 1Min timeframe has data valid
@@ -191,6 +208,8 @@ class MarketDataPipeline:
 
                 bar_close_time = latest_ts.to_pydatetime() + self._timeframe_to_timedelta(timeframe)
                 age = datetime.now(timezone.utc) - bar_close_time
+                if _diag:
+                    print(f"[DIAG] staleness: bar_close={bar_close_time.isoformat()}, now={datetime.now(timezone.utc).isoformat()}, age={age.total_seconds():.1f}s, max={self.max_staleness.total_seconds():.0f}s")
 
                 if age > self.max_staleness:
                     self.logger.warning(
@@ -205,11 +224,17 @@ class MarketDataPipeline:
                     raise DataStalenessError(
                         f"Data stale: {age.total_seconds()}s > {self.max_staleness.total_seconds()}s"
                     )
+            elif _diag:
+                print(f"[DIAG] bars_df empty after drop_incomplete — skipping staleness check")
 
             # Cache result (cache full df; caller tails it)
             self._put_in_cache(symbol, timeframe, bars_df)
 
-            return bars_df.tail(lookback_bars) if bars_df is not None else bars_df
+            _result = bars_df.tail(lookback_bars) if bars_df is not None else bars_df
+            if _diag:
+                _nr = len(_result) if _result is not None and not _result.empty else 0
+                print(f"[DIAG] pipeline returning {_nr} bars for {symbol}")
+            return _result
 
         except Exception as e:
             self.logger.error(
@@ -217,6 +242,8 @@ class MarketDataPipeline:
                 extra={"symbol": symbol, "error": str(e), "timeframe": timeframe},
                 exc_info=True,
             )
+            if _diag:
+                print(f"[DIAG] pipeline EXCEPTION for {symbol}: {type(e).__name__}: {e}")
             raise DataPipelineError(f"Failed to get bars: {e}")
 
     def get_current_price(self, symbol: str) -> Decimal:
