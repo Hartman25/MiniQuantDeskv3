@@ -136,7 +136,7 @@ class PositionStore:
             clock: Optional clock for timestamps (supports backtesting).
                 Defaults to RealTimeClock() for live/paper + unit tests.
         """
-        self.db_path = db_path
+        self.db_path = Path(db_path) if not isinstance(db_path, Path) else db_path
         self.clock = clock or RealTimeClock()
 
         self.logger = get_logger(LogStream.POSITIONS)
@@ -265,7 +265,29 @@ class PositionStore:
                 exc_info=True
             )
             raise PositionStoreError(f"Failed to upsert position: {e}") from e
-    
+
+    def restore_position(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        avg_price: Decimal,
+        entry_time: Optional[datetime] = None,
+    ) -> None:
+        """Restore a position from recovery/reconciliation data.
+
+        Convenience wrapper around :meth:`upsert` used by
+        ``RecoveryCoordinator`` during startup recovery.
+        """
+        pos = Position(
+            symbol=symbol,
+            quantity=quantity,
+            entry_price=avg_price,
+            entry_time=entry_time or self.clock.now(),
+            strategy="recovered",
+            order_id="recovered",
+        )
+        self.upsert(pos)
+
     def get(self, symbol: str) -> Optional[Position]:
         """
         Get position by symbol.

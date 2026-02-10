@@ -82,7 +82,7 @@ class VWAPMicroMeanReversion(IStrategy):
         self.entry_dev = Decimal(str(config.get("entry_deviation_pct", "0.003")))
         self.stop_loss_pct = Decimal(str(config.get("stop_loss_pct", "0.003")))
         self.take_profit_pct = Decimal(str(config.get("take_profit_pct", "0.0015")))
-        self.risk_dollars = Decimal(str(config.get("risk_dollars_per_trade", "1.50")))
+        self.risk_dollars = Decimal(str(config.get("risk_dollars_per_trade", "1.20")))
         self.max_trades_per_day = int(config.get("max_trades_per_day", 1))
         self.daily_loss_limit = Decimal(str(config.get("daily_loss_limit_usd", "2.50")))
 

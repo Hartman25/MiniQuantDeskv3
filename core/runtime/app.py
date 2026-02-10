@@ -815,7 +815,7 @@ def run(opts: RunOptions) -> int:
                 if discrepancies:
                     if hasattr(reconciler, "heal_startup"):
                         try:
-                            reconciler.heal_startup(discrepancies)
+                            reconciler.heal_startup()
                         except Exception as e:
                             logger.exception("Paper reconcile: heal_startup failed: %s", e)
 
@@ -1061,8 +1061,11 @@ def run(opts: RunOptions) -> int:
                             bars = _df_to_contracts(symbol, df)
 
                             # In PAPER/LIVE, act only on fully closed bars (anti-lookahead).
+                            # NOTE: The pipeline already drops incomplete bars via
+                            # _drop_incomplete_last_bar, so use grace_period_seconds=0
+                            # here to avoid rejecting bars the pipeline deemed complete.
                             if opts.mode in ("paper", "live") and bars and not no_market_data_mode:
-                                while bars and not bars[-1].is_complete(timeframe):
+                                while bars and not bars[-1].is_complete(timeframe, grace_period_seconds=0):
                                     bars.pop()
 
                             if not bars:

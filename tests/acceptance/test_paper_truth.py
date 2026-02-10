@@ -260,25 +260,25 @@ class TestPaperTruth:
         # 2. Create an EMPTY local position store (simulating restart)
         import tempfile
         with tempfile.TemporaryDirectory() as tmpdir:
-            ps = PositionStore(
+            with PositionStore(
                 db_path=os.path.join(tmpdir, "positions.db"),
-            )
+            ) as ps:
 
-            class _StubTracker:
-                def get_open_orders(self, symbol=None):
-                    return []
+                class _StubTracker:
+                    def get_open_orders(self, symbol=None):
+                        return []
 
-            reconciler = StartupReconciler(
-                broker=broker,
-                position_store=ps,
-                order_tracker=_StubTracker(),
-            )
+                reconciler = StartupReconciler(
+                    broker=broker,
+                    position_store=ps,
+                    order_tracker=_StubTracker(),
+                )
 
-            discrepancies = reconciler.reconcile_startup()
-            spy_discs = [d for d in discrepancies if getattr(d, "symbol", "") == "SPY"]
-            assert len(spy_discs) > 0, (
-                f"Expected discrepancy for SPY, got: {discrepancies}"
-            )
+                discrepancies = reconciler.reconcile_startup()
+                spy_discs = [d for d in discrepancies if getattr(d, "symbol", "") == "SPY"]
+                assert len(spy_discs) > 0, (
+                    f"Expected discrepancy for SPY, got: {discrepancies}"
+                )
 
         # 3. Cleanup: sell position
         try:

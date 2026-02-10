@@ -24,6 +24,7 @@ import pandas as pd
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.data.enums import DataFeed
 
 from core.logging import get_logger, LogStream
 from core.net.throttler import Throttler, ExponentialBackoff
@@ -177,7 +178,9 @@ class MarketDataPipeline:
             # Prevent lookahead: drop incomplete last bar
             bars_df = self._drop_incomplete_last_bar(bars_df, timeframe)
 
-            # Validate staleness (use last timestamp in UTC)
+            # Validate staleness (use close time of last bar, not open time)
+            # A bar timestamped 09:30 with 1Min timeframe has data valid
+            # through 09:31, so staleness is measured from 09:31, not 09:30.
             if bars_df is not None and not bars_df.empty:
                 latest_ts = pd.Timestamp(bars_df.index[-1])
 
@@ -186,7 +189,8 @@ class MarketDataPipeline:
                 else:
                     latest_ts = latest_ts.tz_convert("UTC")
 
-                age = datetime.now(timezone.utc) - latest_ts.to_pydatetime()
+                bar_close_time = latest_ts.to_pydatetime() + self._timeframe_to_timedelta(timeframe)
+                age = datetime.now(timezone.utc) - bar_close_time
 
                 if age > self.max_staleness:
                     self.logger.warning(
@@ -245,7 +249,8 @@ class MarketDataPipeline:
         request = StockBarsRequest(
             symbol_or_symbols=symbol,
             timeframe=tf,
-            start=start
+            start=start,
+            feed=DataFeed.SIP,
         )
         
         # Fetch

@@ -470,7 +470,7 @@ def _fake_df_to_contracts(symbol: str, df: pd.DataFrame):
         close=Decimal("100.0"),
         volume=1000,
         provider="fake",
-        is_complete=lambda tf: True  # Always complete for tests
+        is_complete=lambda tf, **kw: True  # Always complete for tests
     )]
 
 

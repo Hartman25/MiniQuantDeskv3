@@ -1,38 +1,72 @@
-﻿$ErrorActionPreference = "Stop"
+﻿# ============================================================
+# MiniQuantDesk – Phase 1 Paper Runner
+# Purpose:
+#   - Load local env vars
+#   - Start paper trading using CONFIG-DRIVEN cadence
+#   - NO overrides of runtime logic or config
+#
+# Usage:
+#   Right-click → Run with PowerShell
+#   or
+#   ./run_phase1_paper.ps1
+# ============================================================
 
-Write-Host "=== MiniQuantDesk Phase 1 Startup ===" -ForegroundColor Cyan
-Set-Location "C:\Users\Zacha\Desktop\2"
-
-Write-Host ""
-Write-Host "[1/5] Running pytest..." -ForegroundColor Yellow
-python -m pytest -q
-Write-Host "OK: tests passed" -ForegroundColor Green
-
-Write-Host ""
-Write-Host "[2/5] Verifying entry_paper import safety..." -ForegroundColor Yellow
-$importCheck = python -c "import entry_paper; print('import ok')"
-if ($importCheck.Trim() -ne "import ok") { throw "Import produced unexpected output: $importCheck" }
-Write-Host "OK: import clean" -ForegroundColor Green
-
-Write-Host ""
-Write-Host "[3/5] Environment check..." -ForegroundColor Yellow
-python entry_paper.py --env-check
-Write-Host "OK: env check complete" -ForegroundColor Green
+$ErrorActionPreference = "Stop"
 
 Write-Host ""
-Write-Host "[4/5] Smoke test (single cycle)..." -ForegroundColor Yellow
-python entry_paper.py --once
-Write-Host "OK: smoke test complete" -ForegroundColor Green
+Write-Host "=== MiniQuantDesk :: Phase 1 Paper Launch ===" -ForegroundColor Cyan
 
+# ------------------------------------------------------------
+# Step 1: Move to repo root (this file lives in repo root)
+# ------------------------------------------------------------
+$RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $RepoRoot
+Write-Host "[ok] Repo root: $RepoRoot" -ForegroundColor Green
+
+# ------------------------------------------------------------
+# Step 2: Load config/.env.local into process env
+# ------------------------------------------------------------
+$EnvFile = Join-Path $RepoRoot "config\.env.local"
+
+if (-not (Test-Path $EnvFile)) {
+    Write-Host "[ERROR] Missing config\.env.local" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "[info] Loading environment variables from config\.env.local"
+
+Get-Content $EnvFile | ForEach-Object {
+    $line = $_.Trim()
+    if (-not $line -or $line.StartsWith("#")) { return }
+
+    $parts = $line -split "=", 2
+    if ($parts.Count -ne 2) { return }
+
+    $key = $parts[0].Trim()
+    $val = $parts[1].Trim().Trim('"').Trim("'")
+
+    [System.Environment]::SetEnvironmentVariable($key, $val, "Process")
+}
+
+Write-Host "[ok] Environment loaded" -ForegroundColor Green
+
+# ------------------------------------------------------------
+# Step 3: Launch Phase 1 paper runtime
+# IMPORTANT:
+#   --interval 0 means:
+#     → Use config.yaml session.cycle_interval_seconds
+#     → Closed / pre-open cadence comes from config + env
+# ------------------------------------------------------------
 Write-Host ""
-Write-Host "[5/5] Launching Phase 1 paper runner..." -ForegroundColor Yellow
+Write-Host "[launch] Starting Phase 1 paper runtime" -ForegroundColor Yellow
+Write-Host "         Cadence source: config/config.yaml (session.*)" -ForegroundColor DarkGray
+Write-Host "         Press Ctrl+C to stop cleanly" -ForegroundColor DarkGray
+Write-Host ""
 
-$env:MQD_CLOSED_SLEEP_S          = "120"
-$env:MQD_PREOPEN_WINDOW_M       = "10"
-$env:MQD_PREOPEN_SLEEP_S        = "20"
-$env:MARKET_CLOCK_CACHE_S       = "15"
-$env:MQD_FAIL_OPEN_MARKET_HOURS = "0"
-$env:HEARTBEAT_PRINT            = "1"
+python entry_paper.py --interval 0
 
-Write-Host "Running continuously. Ctrl+C to stop." -ForegroundColor Cyan
-python entry_paper.py --interval 60
+# ------------------------------------------------------------
+# Step 4: Clean exit banner
+# ------------------------------------------------------------
+Write-Host ""
+Write-Host "[exit] Phase 1 paper runtime stopped" -ForegroundColor Cyan

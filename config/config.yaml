@@ -1,21 +1,24 @@
 # ============================================================================
-# MiniQuantDesk v2 Configuration
+# MiniQuantDesk v2 - MICRO ACCOUNT Configuration
 # ============================================================================
-# Single source of truth for all trading parameters
-# Validated on load, fails fast on errors
+# Optimized for $1,000-$1,500 accounts (PDT-safe, tight risk management)
 #
-# IMPORTANT: Parameter names must match strategy constructor exactly
+# STRATEGY: VWAPMicroMeanReversion (ChatGPT micro account version)
+# - Ultra-tight risk management ($1.50/trade, $2.50/day max loss)
+# - Time-gated trading (10:00-11:30 ET for morning volatility)
+# - Max 1 trade/day (well under PDT 3-trade limit)
+# - Auto-flatten at 15:55 ET (avoid overnight risk)
 
 # ============================================================================
-# RISK MANAGEMENT - MICRO ACCOUNT ($1,000-1,500)
+# RISK MANAGEMENT
 # ============================================================================
 risk:
   # Account setup
   initial_account_value: 1000.0            # Your starting capital
   
-  # Position limits (CONSERVATIVE for micro account)
+  # Position limits (MICRO ACCOUNT OPTIMIZED)
   max_open_positions: 1                    # Only 1 position at a time
-  max_position_size_pct: 5.0               # Max 5% of account per position
+  max_position_size_pct: 5.0               # Max 5% of account (conservative)
   
   # Loss limits (TIGHT for micro account)
   daily_loss_limit_usd: 10.0               # Halt if lose $10/day
@@ -26,7 +29,7 @@ risk:
   
   # Circuit breaker
   circuit_breaker_enabled: true
-  circuit_breaker_loss_pct: 2.0            # Trigger at 2% account loss ($20 on $1000)
+  circuit_breaker_loss_pct: 2.0            # Trigger at 2% account loss
   halt_duration_minutes: 60                # Halt for 1 hour
 
 # ============================================================================
@@ -46,16 +49,15 @@ data:
   primary_provider: alpaca
   fallback_providers:
     - polygon
-  max_staleness_seconds: 65                # TIGHTENED: 65s for 1Min bars (was 90s)
+  max_staleness_seconds: 65                # 65s for 1Min bars
   cache_enabled: true
   cache_dir: data/cache
 
 # ============================================================================
-# STRATEGIES - MICRO ACCOUNT (for $1,000-1,500 accounts)
+# STRATEGIES - MICRO ACCOUNT VERSION
 # ============================================================================
-# Using VWAPMicroMeanReversion - optimized for small accounts with PDT limits
 strategies:
-  - name: VWAPMicroMeanReversion           # Micro account strategy (ChatGPT version)
+  - name: VWAPMicroMeanReversion           # ChatGPT's micro account strategy
     enabled: true
     symbols:
       - SPY                                 # Only trades SPY (liquid, predictable)
@@ -63,42 +65,46 @@ strategies:
     lookback_bars: 120
     parameters:
       # VWAP calculation
-      vwap_min_bars: 20                    # Minimum bars before trading
+      vwap_min_bars: 5                    # Minimum bars before trading
       
       # Entry/Exit thresholds (TIGHT for micro account)
-      entry_deviation_pct: 0.003           # 0.3% deviation from VWAP to enter
-      stop_loss_pct: 0.003                 # 0.3% stop loss (tight!)
-      take_profit_pct: 0.0015              # 0.15% take profit target
+      entry_deviation_pct: 0.0012           # 0.3% deviation from VWAP to enter
+      stop_loss_pct: 0.0020                 # 0.3% stop loss (tight!)
+      take_profit_pct: 0.0010              # 0.15% take profit target
       
       # Position sizing (FIXED DOLLAR RISK)
       risk_dollars_per_trade: 1.50         # Risk exactly $1.50 per trade
-      
+      max_notional_usd: 650
+
       # Trade limits (PDT-SAFE)
       max_trades_per_day: 1                # Only 1 trade/day max
-      daily_loss_limit_usd: 2.50           # Stop if lose $2.50 today
+      daily_loss_limit_usd: 10.00           # Stop if lose $2.50 today
       
       # Time gates (US EASTERN TIME)
-      trade_start_time: "10:00"            # Start at 10am ET (after open volatility)
-      trade_end_time: "11:30"              # Stop at 11:30am ET (morning window only)
+      trade_start_time: "09:35"            # Start at 10am ET (after open volatility)
+      trade_end_time: "15:50"              # Stop at 11:30am ET (morning window only)
       flat_time: "15:55"                   # Force exit at 15:55 ET (before close)
 
 # ============================================================================
-# SESSION - PDT-SAFE for accounts under $25k
+# SESSION
 # ============================================================================
 session:
   cycle_interval_seconds: 60               # Check every 60 seconds
-  max_daily_trades: 1                      # PDT protection (matches micro strategy)
+  max_daily_trades: 1                      # PDT protection (matches strategy)
   trading_hours_only: false  # TESTING: allow extended hours
   startup_recovery_enabled: true           # Recover positions on restart
-
+  # ── Adaptive cadence controls ──
+  closed_interval_s: 600        # 10 minutes when market closed
+  pre_open_window_m: 10         # last 10 minutes before open
+  pre_open_interval_s: 120      # 2 minutes during pre-open window
 # ============================================================================
 # LOGGING
 # ============================================================================
 logging:
   log_dir: logs
-  log_level: INFO                          # DEBUG|INFO|WARNING|ERROR|CRITICAL
+  log_level: INFO                          # DEBUG|INFO|WARNING|ERROR
   console_level: INFO
-  json_logs: true                          # JSON format for ML/AI
+  json_logs: true                          # JSON format
   max_bytes: 10000000                      # 10MB per file
   backup_count: 5                          # Keep 5 backups
 

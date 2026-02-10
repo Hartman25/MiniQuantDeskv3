@@ -92,7 +92,10 @@ session:
   max_daily_trades: 1                      # PDT protection (matches strategy)
   trading_hours_only: false  # TESTING: allow extended hours
   startup_recovery_enabled: true           # Recover positions on restart
-
+  # ── Adaptive cadence controls ──
+  closed_interval_s: 600        # 10 minutes when market closed
+  pre_open_window_m: 10         # last 10 minutes before open
+  pre_open_interval_s: 120      # 2 minutes during pre-open window
 # ============================================================================
 # LOGGING
 # ============================================================================

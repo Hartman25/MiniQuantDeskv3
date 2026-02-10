@@ -80,7 +80,7 @@ Thumbs.db
 *.log
 
 # Local data/artifacts (adjust if you DO want these tracked)
-data/
+/data/
 *.db
 *.sqlite
 *.sqlite3
