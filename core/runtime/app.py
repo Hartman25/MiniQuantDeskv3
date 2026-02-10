@@ -934,9 +934,16 @@ def run(opts: RunOptions) -> int:
         # ===============================================================
         # OPERATIONAL READINESS: adaptive sleep + market-hours config
         # ===============================================================
-        _closed_sleep_s = int(os.getenv("MQD_CLOSED_SLEEP_S", "120") or "120")
-        _preopen_sleep_s = int(os.getenv("MQD_PREOPEN_SLEEP_S", "20") or "20")
-        _preopen_window_m = int(os.getenv("MQD_PREOPEN_WINDOW_M", "10") or "10")
+        _session_cfg = getattr(cfg, "session", None)
+        _closed_sleep_s = (
+            getattr(_session_cfg, "closed_interval_s", 0) or 0
+        ) or int(os.getenv("MQD_CLOSED_SLEEP_S", "120") or "120")
+        _preopen_sleep_s = (
+            getattr(_session_cfg, "pre_open_interval_s", 0) or 0
+        ) or int(os.getenv("MQD_PREOPEN_SLEEP_S", "20") or "20")
+        _preopen_window_m = (
+            getattr(_session_cfg, "pre_open_window_m", 0) or 0
+        ) or int(os.getenv("MQD_PREOPEN_WINDOW_M", "10") or "10")
 
         import pytz as _pytz
         _ny_tz = _pytz.timezone("America/New_York")

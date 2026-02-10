@@ -315,6 +315,27 @@ class SessionConfig(BaseModel):
         description="Run recovery protocol on startup"
     )
 
+    # -- Adaptive loop cadence (optional overrides) -------------------------
+    # 0 means "not set" → fall back to env var → hard default.
+    closed_interval_s: int = Field(
+        ge=0,
+        le=600,
+        default=0,
+        description="Sleep seconds when market is closed (0 = use env/default)"
+    )
+    pre_open_interval_s: int = Field(
+        ge=0,
+        le=300,
+        default=0,
+        description="Sleep seconds in pre-open window (0 = use env/default)"
+    )
+    pre_open_window_m: int = Field(
+        ge=0,
+        le=60,
+        default=0,
+        description="Minutes before open to switch to pre-open cadence (0 = use env/default)"
+    )
+
 
 # ============================================================================
 # LOGGING CONFIGURATION

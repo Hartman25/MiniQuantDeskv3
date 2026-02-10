@@ -128,7 +128,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0
 
-    interval = 0 if args.once else max(1, int(args.interval))
+    interval = 0 if args.once else int(args.interval)
+
+    # Config-driven fallback: --interval 0 (without --once) reads from YAML.
+    if interval == 0 and not args.once:
+        from core.config.schema import ConfigSchema
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as fh:
+                raw = yaml.safe_load(fh) or {}
+            _cfg = ConfigSchema(**raw)
+            interval = _cfg.session.cycle_interval_seconds
+        except Exception:
+            interval = 60  # hard default
+    if not args.once:
+        interval = max(1, interval)
 
     try:
         return run_paper(
