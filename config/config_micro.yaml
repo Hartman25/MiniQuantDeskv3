@@ -65,23 +65,23 @@ strategies:
     lookback_bars: 120
     parameters:
       # VWAP calculation
-      vwap_min_bars: 20                    # Minimum bars before trading
+      vwap_min_bars: 5                    # Minimum bars before trading
       
       # Entry/Exit thresholds (TIGHT for micro account)
-      entry_deviation_pct: 0.003           # 0.3% deviation from VWAP to enter
-      stop_loss_pct: 0.003                 # 0.3% stop loss (tight!)
-      take_profit_pct: 0.0015              # 0.15% take profit target
+      entry_deviation_pct: 0.0012           # 0.3% deviation from VWAP to enter
+      stop_loss_pct: 0.0020                 # 0.3% stop loss (tight!)
+      take_profit_pct: 0.0010              # 0.15% take profit target
       
       # Position sizing (FIXED DOLLAR RISK)
       risk_dollars_per_trade: 1.50         # Risk exactly $1.50 per trade
       
       # Trade limits (PDT-SAFE)
       max_trades_per_day: 1                # Only 1 trade/day max
-      daily_loss_limit_usd: 2.50           # Stop if lose $2.50 today
+      daily_loss_limit_usd: 10.00           # Stop if lose $2.50 today
       
       # Time gates (US EASTERN TIME)
-      trade_start_time: "10:00"            # Start at 10am ET (after open volatility)
-      trade_end_time: "11:30"              # Stop at 11:30am ET (morning window only)
+      trade_start_time: "09:35"            # Start at 10am ET (after open volatility)
+      trade_end_time: "15:50"              # Stop at 11:30am ET (morning window only)
       flat_time: "15:55"                   # Force exit at 15:55 ET (before close)
 
 # ============================================================================
