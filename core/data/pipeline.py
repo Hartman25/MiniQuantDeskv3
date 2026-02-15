@@ -1,515 +1,862 @@
+# ============================================
+# MiniQuantDesk :: Market Data Pipeline
+# ============================================
 """
-Market data pipeline with caching and fallback.
+Market data pipeline with caching + validation helpers.
 
-CRITICAL PROPERTIES:
-1. Primary + fallback data sources
-2. Data staleness checks
-3. In-memory cache with TTL
-4. Automatic provider failover
-5. Data validation (schema, timestamps)
-6. Thread-safe caching
+Phase-1 goal:
+- Always return CLOSED bars (anti-lookahead).
+- Fail closed on malformed data.
+- Allow provider failover so you can run paper validation without paying SIP.
 
-Based on LEAN's DataFeed architecture.
+Providers:
+- Alpaca (existing)
+- TwelveData (new fallback/primary if TWELVEDATA_API_KEY is set)
+
+Notes:
+- Alpaca IEX can be delayed / incomplete depending on plan/symbol/feed.
+- TwelveData is used to obtain 1-min bars cheaply/quickly without rewiring later.
 """
 
-from typing import Optional, List, Dict
-from decimal import Decimal
-from datetime import datetime, timedelta, timezone
-import os
-import threading
-import time
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
+from typing import Optional, List, Dict, Any, Tuple
+
+from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+
+import os
 import re
+import threading
+import time
+
 import pandas as pd
+import requests
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
-from alpaca.data.enums import DataFeed
+
+try:
+    # alpaca-py
+    from alpaca.data.enums import DataFeed
+except Exception:  # pragma: no cover
+    DataFeed = None
 
 from core.logging import get_logger, LogStream
 from core.net.throttler import Throttler, ExponentialBackoff
 
 
 # ============================================================================
-# DATA PROVIDER ENUM
+# PROVIDERS
 # ============================================================================
 
 class DataProvider(Enum):
-    """Data provider types."""
-    ALPACA = "ALPACA"
-    POLYGON = "POLYGON"
-    ALPHA_VANTAGE = "ALPHA_VANTAGE"
+    ALPACA = "alpaca"
+    POLYGON = "polygon"
+    ALPHA_VANTAGE = "alpha_vantage"
+    TWELVEDATA = "twelvedata"
 
 
 # ============================================================================
-# BAR DATA
+# EXCEPTIONS
+# ============================================================================
+
+class DataPipelineError(Exception):
+    pass
+
+
+class DataStalenessError(DataPipelineError):
+    pass
+
+
+# ============================================================================
+# DATA OBJECTS
 # ============================================================================
 
 @dataclass
-class BarData:
-    """Single bar (OHLCV) data."""
-    symbol: str
+class CacheEntry:
+    data: pd.DataFrame
     timestamp: datetime
-    open: Decimal
-    high: Decimal
-    low: Decimal
-    close: Decimal
-    volume: int
     provider: DataProvider
-    
-    def to_dict(self) -> Dict:
-        """Convert to dict."""
-        return {
-            "symbol": self.symbol,
-            "timestamp": self.timestamp.isoformat(),
-            "open": str(self.open),
-            "high": str(self.high),
-            "low": str(self.low),
-            "close": str(self.close),
-            "volume": self.volume,
-            "provider": self.provider.value
-        }
 
 
 # ============================================================================
-# DATA PIPELINE
+# MARKET DATA PIPELINE
 # ============================================================================
 
 class MarketDataPipeline:
     """
-    Market data pipeline with caching and fallback.
-    
-    ARCHITECTURE:
-    - Primary provider (Alpaca)
-    - Fallback providers (Polygon, etc.)
-    - In-memory cache with TTL
-    - Staleness validation
-    - Thread-safe
-    
-    USAGE:
-        pipeline = MarketDataPipeline(
-            alpaca_api_key="...",
-            alpaca_api_secret="...",
-            max_staleness_seconds=90
-        )
-        
-        # Get latest bars
-        bars = pipeline.get_latest_bars("SPY", lookback_bars=100)
-        
-        # Get current price
-        price = pipeline.get_current_price("SPY")
+    Fetches OHLCV bar data for symbols with:
+    - In-memory caching
+    - Provider failover
+    - Staleness checks (policy-controlled)
+    - Closed-bar enforcement (anti-lookahead)
+
+    IMPORTANT:
+    - This pipeline returns *bars* only.
+    - Phase-1 "valid to trade?" decisions happen in DataValidator.
     """
-    
+
     def __init__(
         self,
-        alpaca_api_key: str,
-        alpaca_api_secret: str,
-        polygon_api_key: Optional[str] = None,
-        max_staleness_seconds: int = 90,
-        cache_ttl_seconds: int = 30,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        alpaca_api_key: Optional[str] = None,
+        alpaca_api_secret: Optional[str] = None,
+        twelvedata_api_key: Optional[str] = None,
         throttler: Optional[Throttler] = None,
-    ):
-        """Initialize data pipeline."""
+        max_staleness: timedelta = timedelta(seconds=65),
+        cache_ttl: timedelta = timedelta(seconds=30),
+        # legacy config keys (container may still call these)
+        max_staleness_seconds: Optional[int] = None,
+        cache_ttl_seconds: Optional[int] = None,
+        allow_gaps: bool = True,
+        gap_tolerance_pct: float = 5.0,
+        require_complete: bool = True,
+        feed: Optional[str] = None,
+        # NEW: provider routing
+        primary_provider: Optional[object] = None,
+        fallback_providers: Optional[List[object]] = None,
+        # NEW: stale policy (container passes this)
+        allow_stale_in_paper: bool = True,
+        # NEW: throttler limit ids
+        alpaca_limit_id: str = "alpaca_data",
+        twelvedata_limit_id: str = "twelvedata_data",
+    ) -> None:
         self.logger = get_logger(LogStream.DATA)
-        self.max_staleness = timedelta(seconds=max_staleness_seconds)
-        self.cache_ttl = timedelta(seconds=cache_ttl_seconds)
-        
-        # Throttler (optional). If present, ALL external calls must pass through it.
-        self._throttler: Optional[Throttler] = throttler
-        self._backoff = ExponentialBackoff(base=1.0, multiplier=2.0, max_delay=10.0, jitter=True)
 
-        # Alpaca client
-        self.alpaca_client = StockHistoricalDataClient(
-            api_key=alpaca_api_key,
-            secret_key=alpaca_api_secret
-        )
-        
-        # Cache: symbol -> (bars_df, cached_at)
-        self._cache: Dict[str, tuple] = {}
+        # Back-compat: allow container/config to pass seconds
+        if max_staleness_seconds is not None:
+            max_staleness = timedelta(seconds=int(max_staleness_seconds))
+        if cache_ttl_seconds is not None:
+            cache_ttl = timedelta(seconds=int(cache_ttl_seconds))
+
+        # Resolve Alpaca credentials (support both api_key/api_secret and alpaca_* legacy)
+        api_key = api_key or alpaca_api_key or os.getenv("ALPACA_API_KEY") or os.getenv("BROKER_API_KEY")
+        api_secret = api_secret or alpaca_api_secret or os.getenv("ALPACA_API_SECRET") or os.getenv("BROKER_API_SECRET")
+        if not api_key or not api_secret:
+            raise DataPipelineError("Missing Alpaca credentials (api_key/api_secret). Check .env.local.")
+
+        # IMPORTANT: do NOT implicitly read env vars here.
+        # The Container/config layer should pass twelvedata_api_key explicitly.
+        self.twelvedata_api_key = (twelvedata_api_key or "").strip() or None
+
+        # Alpaca client (primary)
+        self.alpaca_client = StockHistoricalDataClient(api_key, api_secret)
+
+        # Behavior configuration
+        self.max_staleness = max_staleness
+        self.cache_ttl = cache_ttl
+
+        # IMPORTANT:
+        # cache_ttl_seconds <= 0 means cache disabled.
+        # Tests rely on this to force throttler execution every call.
+        self._cache_enabled = float(self.cache_ttl.total_seconds()) > 0.0
+
+        self.allow_gaps = bool(allow_gaps)
+        self.gap_tolerance_pct = float(gap_tolerance_pct)
+        self.require_complete = bool(require_complete)
+
+        # Stale policy
+        self.allow_stale_in_paper = bool(allow_stale_in_paper)
+
+        # Throttling / backoff
+        self.throttler = throttler
+        self.backoff = ExponentialBackoff(base=0.5, multiplier=2.0, max_delay=15.0, jitter=True)
+
+        # Throttler bucket ids (TEST CONTRACT: alpaca must default to "alpaca_data")
+        self._alpaca_limit_id = str(alpaca_limit_id or "alpaca_data")
+        self._twelvedata_limit_id = str(twelvedata_limit_id or "twelvedata_data")
+
+        # Alpaca feed selection (IEX vs SIP)
+        self._alpaca_feed = self._select_alpaca_feed(feed)
+
+        # ----------------------------
+        # Provider routing (DEFAULTS MATTER)
+        # Default primary MUST be ALPACA unless explicitly configured otherwise.
+        # ----------------------------
+        def _coerce_provider(p: Optional[object]) -> Optional[DataProvider]:
+            if p is None:
+                return None
+            if isinstance(p, DataProvider):
+                return p
+            s = str(p).strip().lower()
+            if s in ("alpaca", "dataprovider.alpaca"):
+                return DataProvider.ALPACA
+            if s in ("twelvedata", "twelve_data", "twelve-data", "dataprovider.twelvedata"):
+                return DataProvider.TWELVEDATA
+            if s in ("polygon", "dataprovider.polygon"):
+                return DataProvider.POLYGON
+            if s in ("yfinance", "dataprovider.yfinance"):
+                return DataProvider.YFINANCE
+            return None
+
+        primary = _coerce_provider(primary_provider) or DataProvider.ALPACA
+
+        fallbacks: List[DataProvider] = []
+        if fallback_providers:
+            for fp in fallback_providers:
+                c = _coerce_provider(fp)
+                if c and c not in fallbacks:
+                    fallbacks.append(c)
+
+        # If primary is TWELVEDATA but no key was passed, fail over to ALPACA as primary.
+        if primary == DataProvider.TWELVEDATA and not self.twelvedata_api_key:
+            primary = DataProvider.ALPACA
+
+        # Build provider sequence: primary first, then fallbacks, then ensure Alpaca last-resort fallback.
+        seq: List[DataProvider] = [primary]
+        for fp in fallbacks:
+            if fp == primary:
+                continue
+            if fp == DataProvider.TWELVEDATA and not self.twelvedata_api_key:
+                continue
+            seq.append(fp)
+        if DataProvider.ALPACA not in seq:
+            seq.append(DataProvider.ALPACA)
+
+        self.provider_sequence = seq
+
+        # Cache: key should include symbol+timeframe+lookback so tests don't get accidental hits
+        self._cache: Dict[str, CacheEntry] = {}
         self._cache_lock = threading.Lock()
-        
-        self.logger.info("MarketDataPipeline initialized", extra={
-            "max_staleness_seconds": max_staleness_seconds,
-            "cache_ttl_seconds": cache_ttl_seconds
-        })
-    
+
+        self.logger.info(
+            "MarketDataPipeline initialized",
+            extra={
+                "max_staleness_seconds": float(self.max_staleness.total_seconds()),
+                "cache_ttl_seconds": float(self.cache_ttl.total_seconds()),
+                "allow_gaps": self.allow_gaps,
+                "gap_tolerance_pct": self.gap_tolerance_pct,
+                "require_complete": self.require_complete,
+                "allow_stale_in_paper": self.allow_stale_in_paper,
+                "twelvedata_enabled": bool(self.twelvedata_api_key),
+                "alpaca_feed": getattr(self._alpaca_feed, "value", str(self._alpaca_feed)),
+                "providers": [getattr(p, "value", str(p)) for p in self.provider_sequence],
+                "alpaca_limit_id": self._alpaca_limit_id,
+                "twelvedata_limit_id": self._twelvedata_limit_id,
+            },
+        )
+
+    # ============================================================================
+    # PUBLIC API
+    # ============================================================================
+
     def get_latest_bars(
-    self,
-    symbol: str,
-    lookback_bars: int = 100,
-    timeframe: str = "1Min",
-) -> pd.DataFrame:
+        self,
+        symbol: str,
+        lookback_bars: int = 2,
+        timeframe: str = "1Min",
+        force_refresh: bool = False,
+    ) -> Optional[pd.DataFrame]:
         """
-        Get latest bars for symbol.
+        Get latest OHLCV bars for a symbol.
 
-        Args:
-            symbol: Stock symbol
-            lookback_bars: Number of bars to retrieve
-            timeframe: "1Min", "5Min", "1Hour", "1Day"
-
-        Returns:
-            DataFrame with OHLCV data
-
-        Raises:
-            DataPipelineError: If data retrieval fails
+        Returns DataFrame indexed by timestamp with columns:
+        open, high, low, close, volume
         """
-        # -----------------
-        # Cache path
-        # -----------------
-        _diag = os.getenv("PIPELINE_DIAG", "0").strip().lower() in ("1", "true", "yes")
-        cached = self._get_from_cache(symbol, timeframe)
-        if cached is not None:
-            self.logger.debug(f"Cache hit: {symbol} {timeframe}")
-            if _diag:
-                print(f"[DIAG] cache hit {symbol} {timeframe}: {len(cached)} bars, last_ts={cached.index[-1] if not cached.empty else 'EMPTY'}")
+        cache_key = f"{symbol}_{timeframe}"
 
-            # Prevent lookahead on cached path too
-            cached = self._drop_incomplete_last_bar(cached, timeframe)
-
+        # 1) cache
+        if self._cache_enabled and not force_refresh:
+            cached = self._get_cached(cache_key)
             if cached is not None and not cached.empty:
-                if _diag:
-                    print(f"[DIAG] cache returning {len(cached.tail(lookback_bars))} bars for {symbol}")
-                return cached.tail(lookback_bars)
-            elif _diag:
-                print(f"[DIAG] cache empty after drop_incomplete for {symbol}")
+                # Always respect requested lookback even if cache stores more.
+                return cached.tail(int(lookback_bars)).copy()
 
-        # -----------------
-        # Provider path
-        # -----------------
-        try:
-            # Fetch a bit extra so dropping the last bar doesn't leave us short
-            fetch_n = max(int(lookback_bars) + 2, 3)
+        tf_obj, tf_label = self._normalize_timeframe(timeframe)
 
-            bars_df = self._fetch_from_alpaca(symbol, fetch_n, timeframe)
-            if _diag:
-                _n = len(bars_df) if bars_df is not None and not bars_df.empty else 0
-                _last = bars_df.index[-1] if _n > 0 else "EMPTY"
-                _first = bars_df.index[0] if _n > 0 else "EMPTY"
-                print(f"[DIAG] alpaca returned {_n} bars for {symbol}, range=[{_first} .. {_last}]")
+        # 2) providers
+        last_error: Optional[Exception] = None
 
-            # Prevent lookahead: drop incomplete last bar
-            bars_df = self._drop_incomplete_last_bar(bars_df, timeframe)
-            if _diag:
-                _n2 = len(bars_df) if bars_df is not None and not bars_df.empty else 0
-                _last2 = bars_df.index[-1] if _n2 > 0 else "EMPTY"
-                print(f"[DIAG] after drop_incomplete: {_n2} bars, last_ts={_last2}")
+        # Fetch a little extra so we can drop last incomplete bar and still have enough
+        fetch_n = max(int(lookback_bars) + 2, 3)
 
-            # Validate staleness (use close time of last bar, not open time)
-            # A bar timestamped 09:30 with 1Min timeframe has data valid
-            # through 09:31, so staleness is measured from 09:31, not 09:30.
-            if bars_df is not None and not bars_df.empty:
-                latest_ts = pd.Timestamp(bars_df.index[-1])
+        for provider in self.provider_sequence:
+            try:
+                bars_df = self._fetch_bars(symbol, fetch_n, tf_obj, tf_label, provider)
 
-                if latest_ts.tzinfo is None:
-                    latest_ts = latest_ts.tz_localize("UTC")
-                else:
-                    latest_ts = latest_ts.tz_convert("UTC")
+                if bars_df is None or bars_df.empty:
+                    self.logger.info("[data] %s: no_closed_bars_available", symbol, extra={"symbol": symbol})
+                    continue
 
-                bar_close_time = latest_ts.to_pydatetime() + self._timeframe_to_timedelta(timeframe)
-                age = datetime.now(timezone.utc) - bar_close_time
-                if _diag:
-                    print(f"[DIAG] staleness: bar_close={bar_close_time.isoformat()}, now={datetime.now(timezone.utc).isoformat()}, age={age.total_seconds():.1f}s, max={self.max_staleness.total_seconds():.0f}s")
+                # Normalize & enforce closed bars
+                bars_df = self._drop_incomplete_last_bar(bars_df, tf_label)
+                if bars_df is None or bars_df.empty:
+                    self.logger.info("[data] %s: only_incomplete_bar_available", symbol, extra={"symbol": symbol})
+                    continue
 
+                # Validate
+                if not self._validate_bars(bars_df, symbol, tf_label):
+                    self.logger.warning("[data] %s: validation_failed", symbol, extra={"symbol": symbol})
+                    continue
+
+                # Staleness check (policy-controlled)
+                latest_ts = self._safe_last_timestamp(bars_df)
+                now_utc = datetime.now(timezone.utc)
+                age = now_utc - latest_ts
                 if age > self.max_staleness:
-                    self.logger.warning(
-                        f"Data stale for {symbol}",
-                        extra={
-                            "symbol": symbol,
-                            "age_seconds": age.total_seconds(),
-                            "max_staleness": self.max_staleness.total_seconds(),
-                            "timeframe": timeframe,
-                        },
-                    )
-                    raise DataStalenessError(
-                        f"Data stale: {age.total_seconds()}s > {self.max_staleness.total_seconds()}s"
-                    )
-            elif _diag:
-                print(f"[DIAG] bars_df empty after drop_incomplete — skipping staleness check")
+                    if self._stale_allowed():
+                        self.logger.warning(
+                            "Data stale for %s (allowed by policy); continuing with delayed bars",
+                            symbol,
+                            extra={
+                                "symbol": symbol,
+                                "age_seconds": age.total_seconds(),
+                                "max_staleness_seconds": self.max_staleness.total_seconds(),
+                                "timeframe": tf_label,
+                                "provider": provider.value,
+                            },
+                        )
+                    else:
+                        raise DataStalenessError(
+                            f"Data stale: {age.total_seconds()}s > {self.max_staleness.total_seconds()}s"
+                        )
 
-            # Cache result (cache full df; caller tails it)
-            self._put_in_cache(symbol, timeframe, bars_df)
+                # Cache & return
+                self._set_cached(cache_key, bars_df, provider)
+                return bars_df.tail(int(lookback_bars))
 
-            _result = bars_df.tail(lookback_bars) if bars_df is not None else bars_df
-            if _diag:
-                _nr = len(_result) if _result is not None and not _result.empty else 0
-                print(f"[DIAG] pipeline returning {_nr} bars for {symbol}")
-            return _result
+            except Exception as e:
+                last_error = e
+                self.logger.warning(
+                    "Failed to get bars from %s for %s: %s",
+                    provider.value,
+                    symbol,
+                    e,
+                    extra={"symbol": symbol, "provider": provider.value},
+                    exc_info=True,
+                )
+                continue
 
-        except Exception as e:
-            self.logger.error(
-                f"Failed to get bars for {symbol}",
-                extra={"symbol": symbol, "error": str(e), "timeframe": timeframe},
-                exc_info=True,
-            )
-            if _diag:
-                print(f"[DIAG] pipeline EXCEPTION for {symbol}: {type(e).__name__}: {e}")
-            raise DataPipelineError(f"Failed to get bars: {e}")
+        self.logger.error("Failed to get bars for %s", symbol, extra={"symbol": symbol, "error": str(last_error)}, exc_info=True)
+        return None
 
     def get_current_price(self, symbol: str) -> Decimal:
-        """Get current price for symbol."""
         bars = self.get_latest_bars(symbol, lookback_bars=1)
-        if bars.empty:
+        if bars is None or bars.empty:
             raise DataPipelineError(f"No data for {symbol}")
-        
-        latest = bars.iloc[-1]
-        return Decimal(str(latest['close']))
-    
-    def _fetch_from_alpaca(
+        return Decimal(str(bars.iloc[-1]["close"]))
+
+    # ============================================================================
+    # PROVIDER DISPATCH
+    # ============================================================================
+
+    def _fetch_bars(
         self,
         symbol: str,
         lookback_bars: int,
-        timeframe: str
+        tf_obj: Any,
+        tf_label: str,
+        provider: DataProvider,
     ) -> pd.DataFrame:
-        """Fetch bars from Alpaca."""
-        # Map timeframe
-        tf = self._map_timeframe(timeframe)
-        
-        # Calculate start time
-        # Rough estimate: 1Min = 1 bar per minute during market hours (6.5 hours = 390 mins)
-        if timeframe == "1Min":
-            start = datetime.now(timezone.utc) - timedelta(days=max(1, lookback_bars // 390 + 1))
+        if provider == DataProvider.ALPACA:
+            return self._fetch_from_alpaca(symbol, lookback_bars, tf_obj, tf_label)
+        elif provider == DataProvider.TWELVEDATA:
+            return self._fetch_from_twelvedata(symbol, lookback_bars, tf_label)
+        elif provider == DataProvider.POLYGON:
+            raise NotImplementedError("Polygon provider not implemented")
+        elif provider == DataProvider.ALPHA_VANTAGE:
+            raise NotImplementedError("Alpha Vantage provider not implemented")
         else:
-            start = datetime.now(timezone.utc) - timedelta(days=lookback_bars)
-        
-        # Build request
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=tf,
-            start=start,
-            feed=DataFeed.SIP,
-        )
-        
-        # Fetch
-        self.logger.debug(f"Fetching {lookback_bars} bars for {symbol} from Alpaca")
-        
-        # Fetch with throttling + bounded retry/backoff (fail-closed)
-        def _do_call():
-            return self.alpaca_client.get_stock_bars(request)
+            raise DataPipelineError(f"Unknown provider: {provider}")
+
+    # ============================================================================
+    # TWELVEDATA
+    # ============================================================================
+
+    def _fetch_from_twelvedata(self, symbol: str, lookback_bars: int, tf_label: str) -> pd.DataFrame:
+        """
+        Fetch bars from Twelve Data (https://twelvedata.com) time_series endpoint.
+
+        Notes:
+        - Twelve Data returns JSON with 'values' as strings.
+        - We request timezone=UTC to standardize timestamps.
+        - Returned DataFrame index is UTC tz-aware DatetimeIndex.
+        """
+        if not self.twelvedata_api_key:
+            raise DataPipelineError("TWELVEDATA provider selected but TWELVEDATA_API_KEY is not set")
+
+        try:
+            lookback_bars_int = int(lookback_bars)
+        except Exception as e:
+            raise DataPipelineError(f"lookback_bars must be int-like, got {lookback_bars!r}: {e}") from e
+        if lookback_bars_int <= 0:
+            raise DataPipelineError(f"lookback_bars must be > 0, got {lookback_bars_int}")
+
+        interval = self._twelvedata_interval(tf_label)
+
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": str(min(max(lookback_bars_int, 2), 5000)),
+            "timezone": "UTC",
+            "format": "JSON",
+            "apikey": self.twelvedata_api_key,
+        }
+
+        url = "https://api.twelvedata.com/time_series"
+
+        def _call():
+            return requests.get(url, params=params, timeout=15)
 
         last_err: Optional[Exception] = None
+        resp = None
         for attempt in range(3):
             try:
-                if self._throttler is not None:
-                    bars = self._throttler.execute_sync('alpaca_data', _do_call)
+                # If a throttler exists, try to route via an existing low-frequency bucket (fmp),
+                # otherwise call directly. This avoids requiring a new throttler key.
+                if self.throttler is not None and hasattr(self.throttler, "execute_sync"):
+                    resp = self.throttler.execute_sync(self._twelvedata_limit_id, _call)
                 else:
-                    bars = _do_call()
+                    resp = _call()
+
+                if resp.status_code >= 400:
+                    raise DataPipelineError(f"TwelveData HTTP {resp.status_code}: {resp.text[:200]}")
                 last_err = None
                 break
             except Exception as e:
                 last_err = e
+                delay = self.backoff.next_delay(attempt)
                 msg = str(e).lower()
-                is_rate = ('429' in msg) or ('rate limit' in msg) or ('too many request' in msg)
-                is_transient = is_rate or ('timeout' in msg) or ('temporar' in msg) or ('connection' in msg)
-                if attempt < 2 and is_transient:
-                    delay = self._backoff.next_delay(attempt)
+                transient = any(k in msg for k in ("429", "rate", "timeout", "temporar", "connection", "reset", "502", "503", "504"))
+                if attempt < 2 and transient:
                     self.logger.warning(
-                        'Alpaca bars fetch failed (transient), backing off',
-                        extra={'symbol': symbol, 'attempt': attempt + 1, 'delay_s': round(delay, 2), 'error': str(e)}
+                        "TwelveData bars fetch failed (transient), backing off",
+                        extra={"symbol": symbol, "attempt": attempt + 1, "delay_s": round(delay, 2), "error": str(e)},
                     )
                     time.sleep(delay)
                     continue
                 break
 
         if last_err is not None:
-            raise DataPipelineError(f'Alpaca bars fetch failed: {last_err}')
+            raise DataPipelineError(f"TwelveData bars fetch failed: {last_err}")
 
-        
-        if symbol not in bars:
+        try:
+            payload = resp.json()
+        except Exception as e:
+            raise DataPipelineError(f"TwelveData JSON decode failed: {e}") from e
+
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            raise DataPipelineError(f"TwelveData error: {payload.get('message') or payload}")
+
+        values = payload.get("values") if isinstance(payload, dict) else None
+        if not values:
             return pd.DataFrame()
-        
-        # Convert to DataFrame
-        df = bars[symbol].df
-        
+
+        rows: List[Dict[str, Any]] = []
+        for v in reversed(values):  # newest-first -> oldest-first
+            try:
+                ts = pd.to_datetime(v.get("datetime"), utc=True)
+                rows.append(
+                    {
+                        "timestamp": ts,
+                        "open": float(v.get("open")),
+                        "high": float(v.get("high")),
+                        "low": float(v.get("low")),
+                        "close": float(v.get("close")),
+                        "volume": float(v.get("volume") or 0.0),
+                    }
+                )
+            except Exception:
+                continue
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows).set_index("timestamp")
+        if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is None:
+            df.index = df.index.tz_localize("UTC")
+        df = df.sort_index()
+
         self.logger.info(
-            f"Fetched {len(df)} bars for {symbol}",
-            extra={
-                "symbol": symbol,
-                "bars": len(df),
-                "timeframe": timeframe
-            }
+            "Fetched %s bars for %s (TwelveData)",
+            len(df),
+            symbol,
+            extra={"symbol": symbol, "bars": int(len(df)), "timeframe": tf_label, "provider": "twelvedata"},
         )
-        
         return df
-    
-    def _map_timeframe(self, timeframe: str) -> TimeFrame:
-        """Map timeframe string to Alpaca TimeFrame."""
-        mapping = {
-            "1Min": TimeFrame(1, TimeFrameUnit.Minute),
-            "5Min": TimeFrame(5, TimeFrameUnit.Minute),
-            "15Min": TimeFrame(15, TimeFrameUnit.Minute),
-            "1Hour": TimeFrame(1, TimeFrameUnit.Hour),
-            "1Day": TimeFrame(1, TimeFrameUnit.Day)
+
+    def _twelvedata_interval(self, tf_label: str) -> str:
+        """Convert internal timeframe label (e.g. '1Min') to TwelveData interval string."""
+        tf = str(tf_label or "").strip().lower()
+        if tf in ("1min", "1m", "minute", "1 minute"):
+            return "1min"
+        if tf in ("5min", "5m", "5 minutes"):
+            return "5min"
+        if tf in ("15min", "15m", "15 minutes"):
+            return "15min"
+        if tf in ("1hour", "1h", "60min", "60m"):
+            return "1h"
+        if tf in ("1day", "day", "1d"):
+            return "1day"
+
+        m = re.match(r"^(\d+)\s*(min|m|h|hr|hour|d|day)s?$", tf)
+        if not m:
+            return "1min"
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit in ("min", "m"):
+            return f"{n}min"
+        if unit in ("h", "hr", "hour"):
+            return f"{n}h"
+        if unit in ("d", "day"):
+            return f"{n}day"
+        return "1min"
+
+    # ============================================================================
+    # ALPACA
+    # ============================================================================
+
+    def _fetch_from_alpaca(self, symbol: str, lookback_bars: int, tf_obj: Any, tf_label: str) -> pd.DataFrame:
+        """
+        Fetch bars from Alpaca using alpaca-py.
+
+        Normalizes DataFrame index to a simple DatetimeIndex (UTC) even if alpaca returns MultiIndex.
+        """
+        # Harden: defensive coercion
+        try:
+            lookback_bars_int = int(lookback_bars)
+        except Exception as e:
+            raise DataPipelineError(f"lookback_bars must be int-like, got {lookback_bars!r}: {e}") from e
+
+        if lookback_bars_int <= 0:
+            raise DataPipelineError(f"lookback_bars must be > 0, got {lookback_bars_int}")
+
+        now_utc = datetime.now(timezone.utc)
+
+        request_kwargs: Dict[str, Any] = {
+            "symbol_or_symbols": symbol,
+            "timeframe": tf_obj,
+            "end": now_utc,
+            "limit": lookback_bars_int,
         }
-        return mapping.get(timeframe, TimeFrame(1, TimeFrameUnit.Minute))
-    
-    def _get_from_cache(self, symbol: object, timeframe: Optional[str] = None) -> Optional[pd.DataFrame]:
-        """Get cached bars for (symbol, timeframe) if not expired.
+        if self._alpaca_feed is not None:
+            request_kwargs["feed"] = self._alpaca_feed
 
-        Canonical call style:
-            cached = self._get_from_cache(symbol, timeframe)
+        request = StockBarsRequest(**request_kwargs)
 
-        Backward-compat:
-            _get_from_cache((symbol, timeframe)) or _get_from_cache("SYMB:1Min")
+        def _call():
+            return self.alpaca_client.get_stock_bars(request)
+
+        # bounded retry
+        last_err: Optional[Exception] = None
+        resp = None
+        for attempt in range(3):
+            try:
+                if self.throttler is not None and hasattr(self.throttler, "execute_sync"):
+                    resp = self.throttler.execute_sync(self._alpaca_limit_id, _call)
+                else:
+                    resp = _call()
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                delay = self.backoff.next_delay(attempt)
+                msg = str(e).lower()
+                transient = any(k in msg for k in ("429", "rate", "timeout", "temporar", "connection", "reset"))
+                if attempt < 2 and transient:
+                    self.logger.warning(
+                        "Alpaca bars fetch failed (transient), backing off",
+                        extra={"symbol": symbol, "attempt": attempt + 1, "delay_s": round(delay, 2), "error": str(e)},
+                    )
+                    time.sleep(delay)
+                    continue
+                break
+
+        if last_err is not None:
+            raise DataPipelineError(f"Alpaca bars fetch failed: {last_err}")
+
+        df = self._alpaca_response_to_df(resp, symbol)
+        try:
+            df = df.sort_index()
+        except Exception:
+            pass
+
+        self.logger.info(
+            "Fetched %s bars for %s",
+            len(df),
+            symbol,
+            extra={"symbol": symbol, "bars": int(len(df)), "timeframe": tf_label, "provider": "alpaca"},
+        )
+        return df
+
+    def _alpaca_response_to_df(self, resp: Any, symbol: str) -> pd.DataFrame:
         """
-        # Backward-compat: allow callers to pass a pre-built key
-        if timeframe is None and isinstance(symbol, tuple) and len(symbol) == 2:
-            symbol, timeframe = symbol
-        if timeframe is None and isinstance(symbol, str) and ":" in symbol:
-            symbol, timeframe = symbol.split(":", 1)
+        Convert alpaca-py BarsResponse to a DataFrame indexed by timestamp.
 
-        cache_key = (str(symbol), str(timeframe))
-
-        with self._cache_lock:
-            item = self._cache.get(cache_key)
-            if item is None:
-                return None
-
-            df, cached_at = item
-            now = datetime.now(timezone.utc)
-            if cached_at.tzinfo is None:
-                cached_at = cached_at.replace(tzinfo=timezone.utc)
-            age = now - cached_at
-
-            if age < self.cache_ttl:
-                return df
-
-            del self._cache[cache_key]
-            return None
-
-
-    def _put_in_cache(self, symbol: object, timeframe: Optional[str], df: Optional[pd.DataFrame] = None) -> None:
-        """Put bars into cache under (symbol, timeframe).
-
-        Canonical call style:
-            self._put_in_cache(symbol, timeframe, bars_df)
-
-        Backward-compat:
-            _put_in_cache((symbol, timeframe), df) or _put_in_cache("SYMB:1Min", df)
+        Handles:
+        - resp.df MultiIndex (symbol, timestamp)
+        - dict-like resp[symbol].df
         """
-        # Backward-compat: allow callers to pass (cache_key, df)
-        if df is None and isinstance(timeframe, pd.DataFrame):
-            df = timeframe
-            timeframe = None
+        if resp is None:
+            return pd.DataFrame()
 
-        if isinstance(symbol, tuple) and len(symbol) == 2:
-            symbol, timeframe = symbol
-        if timeframe is None and isinstance(symbol, str) and ":" in symbol:
-            symbol, timeframe = symbol.split(":", 1)
+        df = None
+        try:
+            if hasattr(resp, "df") and resp.df is not None:
+                df = resp.df.copy()
+            elif hasattr(resp, "__getitem__"):
+                df = resp[symbol].df.copy()
+        except Exception:
+            df = None
 
         if df is None:
-            raise TypeError("_put_in_cache expected a DataFrame, got None")
+            return pd.DataFrame()
 
-        cache_key = (str(symbol), str(timeframe))
-        with self._cache_lock:
-            self._cache[cache_key] = (df, datetime.now(timezone.utc))
+        # Normalize multi-index -> timestamp index
+        if isinstance(df.index, pd.MultiIndex):
+            names = [n or "" for n in df.index.names]
+            # common: level 0 symbol, level 1 timestamp
+            try:
+                df = df.xs(symbol, level=0)
+            except Exception:
+                try:
+                    df = df.droplevel(0)
+                except Exception:
+                    pass
 
+        # Clean index to tz-aware UTC
+        if isinstance(df.index, pd.DatetimeIndex):
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            else:
+                df.index = df.index.tz_convert("UTC")
+        else:
+            # last resort
+            df.index = pd.to_datetime(df.index, utc=True)
 
-    def clear_cache(self) -> None:
-        """Clear all cached market data."""
-        with self._cache_lock:
-            self._cache.clear()
-        self.logger.info("Cache cleared")
+        # Ensure expected columns exist
+        # alpaca uses: open, high, low, close, volume
+        return df
 
-    def _timeframe_to_timedelta(self, timeframe: str) -> timedelta:
-        tf = (timeframe or "").strip().lower()
+    # ============================================================================
+    # VALIDATION + TIMEFRAME HELPERS
+    # ============================================================================
 
-        # Common formats: "1Min", "5Min", "1Hour", "1Day"
-        if tf.endswith("min"):
-            n = int(tf[:-3] or "1")
-            return timedelta(minutes=n)
-        if tf.endswith("hour"):
-            n = int(tf[:-4] or "1")
-            return timedelta(hours=n)
-        if tf.endswith("day"):
-            n = int(tf[:-3] or "1")
-            return timedelta(days=n)
+    def _validate_bars(self, df: pd.DataFrame, symbol: str, tf_label: str) -> bool:
+        if df is None or df.empty:
+            return False
 
-        # Also accept "1m", "5m", "1h", "1d"
-        if tf.endswith("m"):
-            return timedelta(minutes=int(tf[:-1] or "1"))
-        if tf.endswith("h"):
-            return timedelta(hours=int(tf[:-1] or "1"))
-        if tf.endswith("d"):
-            return timedelta(days=int(tf[:-1] or "1"))
+        required_cols = {"open", "high", "low", "close", "volume"}
+        if not required_cols.issubset(set(df.columns)):
+            self.logger.warning("Missing required columns for %s", symbol, extra={"symbol": symbol, "cols": list(df.columns)})
+            return False
 
-        # Default safe behavior
-        return timedelta(minutes=1)
+        # index must be datetime
+        try:
+            pd.to_datetime(df.index)
+        except Exception:
+            self.logger.warning("Invalid datetime index for %s", symbol, extra={"symbol": symbol})
+            return False
 
-    def _drop_incomplete_last_bar(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+        # gap checks are handled in validator (Phase-1), keep here fail-open unless explicitly disallowed
+        if not self.allow_gaps and self._has_large_gaps(df, tf_label):
+            return False
+
+        return True
+
+    def _normalize_timeframe(self, timeframe: str) -> Tuple[Any, str]:
         """
-        Drop the last bar if it is not complete yet (anti-lookahead).
-        Completeness rule: now >= last_ts + timeframe_duration
+        Normalize timeframe input into:
+        - tf_obj: Alpaca TimeFrame object (for alpaca)
+        - tf_label: canonical label string used throughout system ("1Min", "5Min", ...)
+        """
+        tf = str(timeframe or "").strip()
+        # Canonical label
+        if tf in ("1Min", "1min", "1m"):
+            return TimeFrame(1, TimeFrameUnit.Minute), "1Min"
+        if tf in ("5Min", "5min", "5m"):
+            return TimeFrame(5, TimeFrameUnit.Minute), "5Min"
+        if tf in ("15Min", "15min", "15m"):
+            return TimeFrame(15, TimeFrameUnit.Minute), "15Min"
+        if tf in ("1Hour", "1hour", "1h", "60Min", "60min", "60m"):
+            return TimeFrame(1, TimeFrameUnit.Hour), "1Hour"
+        if tf in ("1Day", "1day", "1d", "Day", "day"):
+            return TimeFrame(1, TimeFrameUnit.Day), "1Day"
 
-        NOTE:
-        - If df has only 1 row, dropping would create an empty result. In that case,
-          keep the single bar to avoid "no data" behavior in sparse/test environments.
+        # parse like "2min", "10m", "3h"
+        m = re.match(r"^(\d+)\s*(min|m|hour|hr|h|day|d)$", tf.lower())
+        if not m:
+            # default safe
+            return TimeFrame(1, TimeFrameUnit.Minute), "1Min"
+
+        n = int(m.group(1))
+        unit = m.group(2)
+        if unit in ("min", "m"):
+            return TimeFrame(n, TimeFrameUnit.Minute), f"{n}Min"
+        if unit in ("hour", "hr", "h"):
+            return TimeFrame(n, TimeFrameUnit.Hour), f"{n}Hour"
+        if unit in ("day", "d"):
+            return TimeFrame(n, TimeFrameUnit.Day), f"{n}Day"
+
+        return TimeFrame(1, TimeFrameUnit.Minute), "1Min"
+
+    def _safe_last_timestamp(self, df: pd.DataFrame) -> datetime:
+        idx_last = df.index[-1]
+        if isinstance(idx_last, tuple):
+            idx_last = idx_last[-1]
+        ts = pd.Timestamp(idx_last)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        return ts.to_pydatetime()
+
+    def _timeframe_to_seconds(self, tf_label: str) -> int:
+        tf = str(tf_label or "").strip().lower()
+        if tf.endswith("min"):
+            try:
+                n = int(tf[:-3] or "1")
+            except Exception:
+                n = 1
+            return n * 60
+        if tf.endswith("hour"):
+            try:
+                n = int(tf[:-4] or "1")
+            except Exception:
+                n = 1
+            return n * 3600
+        if tf.endswith("day"):
+            try:
+                n = int(tf[:-3] or "1")
+            except Exception:
+                n = 1
+            return n * 86400
+        # default
+        return 60
+
+    def _drop_incomplete_last_bar(self, df: pd.DataFrame, tf_label: str) -> pd.DataFrame:
+        """
+        Anti-lookahead: drop last bar if it's still "in progress".
+
+        Completeness rule:
+          now_utc >= last_ts + timeframe_duration
         """
         if df is None or df.empty:
             return df
 
-        # Ensure a DatetimeIndex
         if not isinstance(df.index, pd.DatetimeIndex):
-            return df
+            try:
+                df = df.copy()
+                df.index = pd.to_datetime(df.index, utc=True)
+            except Exception:
+                return df
 
-        # If there's only one bar, don't drop it to empty the result.
-        # (We still drop the last bar when we have at least one earlier bar.)
         if len(df) <= 1:
+            # don’t drop to empty (Phase-1: keep running)
             return df
 
         last_ts = df.index[-1]
-
-        # Normalize timezone: compare now in the same tz as last_ts
         if last_ts.tzinfo is None:
-            now = datetime.utcnow().replace(tzinfo=timezone.utc)
-            last_ts = last_ts.tz_localize(timezone.utc)
-            # (optional) also localize whole index if you want consistency:
-            # df = df.tz_localize(timezone.utc)
-        else:
-            now = datetime.now(tz=last_ts.tzinfo)
+            last_ts = last_ts.tz_localize("UTC")
 
-        dur = self._timeframe_to_timedelta(timeframe)
+        dur = timedelta(seconds=self._timeframe_to_seconds(tf_label))
+        now = datetime.now(timezone.utc)
 
-        # If the bar hasn't had time to "finish", drop it
+        # If the bar hasn't had time to finish, drop it
         if now < (last_ts.to_pydatetime() + dur):
-            self.logger.warning(
-                "Dropping incomplete last bar (anti-lookahead)",
-                extra={
-                    "timeframe": timeframe,
-                    "last_ts": str(last_ts),
-                    "now": now.isoformat(),
-                    "seconds_remaining": (last_ts.to_pydatetime() + dur - now).total_seconds(),
-                },
-            )
             return df.iloc[:-1]
 
         return df
 
-    def _ensure_utc_index(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Make sure df.index is a tz-aware DatetimeIndex in UTC."""
+    def _has_large_gaps(self, df: pd.DataFrame, tf_label: str) -> bool:
+        if df is None or df.empty or len(df) < 3:
+            return False
+
+        expected = pd.Timedelta(seconds=self._timeframe_to_seconds(tf_label))
+        idx = pd.to_datetime(df.index, utc=True)
+        diffs = pd.Series(idx).diff().dropna()
+        if diffs.empty:
+            return False
+
+        max_allowed = expected * (1 + float(self.gap_tolerance_pct) / 100.0)
+        return bool((diffs > max_allowed).any())
+
+    # ============================================================================
+    # CACHE
+    # ============================================================================
+
+    def _get_cached(self, key: str) -> Optional[pd.DataFrame]:
+        if not self._cache_enabled:
+            return None
+
+        with self._cache_lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return None
+
+            age = (datetime.now(timezone.utc) - entry.timestamp).total_seconds()
+            if age > float(self.cache_ttl.total_seconds()):
+                # Expired
+                self._cache.pop(key, None)
+                return None
+
+            return entry.data
+
+    def _set_cached(self, key: str, df: pd.DataFrame, provider: DataProvider) -> None:
+        if not self._cache_enabled:
+            return
+
         if df is None or df.empty:
-            return df
-        if not isinstance(df.index, pd.DatetimeIndex):
-            # If your fetch returns a timestamp column instead of index, handle it here if needed.
-            # Otherwise leave it and let downstream fail loudly.
-            return df
+            return
 
-        if df.index.tz is None:
-            df = df.copy()
-            df.index = df.index.tz_localize(timezone.utc)
-        else:
-            df = df.tz_convert(timezone.utc)
-        return df
-    
-# ============================================================================
-# EXCEPTIONS
-# ============================================================================
+        with self._cache_lock:
+            self._cache[key] = CacheEntry(
+                data=df,
+                timestamp=datetime.now(timezone.utc),
+                provider=provider,
+            )
 
-class DataPipelineError(Exception):
-    """Data pipeline error."""
-    pass
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._cache.clear()
 
+    # ============================================================================
+    # POLICY HELPERS
+    # ============================================================================
 
-class DataStalenessError(DataPipelineError):
-    """Data staleness error."""
-    pass
+    def _stale_allowed(self) -> bool:
+        """
+        Allow stale bars in PAPER mode when permitted by config.
+        Env var MQD_ALLOW_STALE_BARS can hard-override:
+        - "0" => force fail-closed
+        - "1" => force allow
+        - unset => defer to config (self.allow_stale_in_paper)
+        """
+        paper = os.getenv("PAPER_TRADING", "").strip().lower() in ("1", "true", "yes")
+        if not paper:
+            return False
+
+        env = os.getenv("MQD_ALLOW_STALE_BARS")
+        if env is not None:
+            return env.strip().lower() in ("1", "true", "yes")
+
+        return bool(self.allow_stale_in_paper)
+
+    def _select_alpaca_feed(self, feed: Optional[str]) -> Any:
+        """
+        Select Alpaca feed if available.
+
+        feed:
+          - "IEX" or "SIP"
+        """
+        if DataFeed is None:
+            return None
+
+        if not feed:
+            # allow ENV override
+            feed = os.getenv("ALPACA_DATA_FEED") or os.getenv("APCA_DATA_FEED")
+
+        if not feed:
+            return None
+
+        f = str(feed).strip().upper()
+        if f == "IEX":
+            return DataFeed.IEX
+        if f == "SIP":
+            return DataFeed.SIP
+        return None

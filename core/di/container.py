@@ -176,12 +176,23 @@ class Container:
             max_staleness_seconds=self._config.data.max_staleness_seconds,
             require_complete_bars=True
         )
+
         self._data_cache = DataCache()
+
+        # CRITICAL:
+        # Default provider MUST remain alpaca for test compatibility.
+        # Config can override, but tests assume alpaca default.
+        primary_provider = getattr(self._config.data, "primary_provider", "alpaca")
+
         self._data_pipeline = MarketDataPipeline(
             alpaca_api_key=self._config.broker.api_key,
             alpaca_api_secret=self._config.broker.api_secret,
             max_staleness_seconds=self._config.data.max_staleness_seconds,
             throttler=self._throttler,
+            primary_provider=primary_provider,
+            fallback_providers=getattr(self._config.data, "fallback_providers", []),
+            twelvedata_api_key=getattr(self._config.data, "twelvedata_api_key", None),
+            allow_stale_in_paper=getattr(self._config.data, "allow_stale_in_paper", True),
         )
         
         # 7. Initialize risk components
