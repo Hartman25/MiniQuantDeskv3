@@ -254,20 +254,21 @@ class TestImportTimeSafety:
         )
 
     def test_reconciliation_module_no_warnings_at_import(self):
-        """core.execution.reconciliation must not emit warnings at import time."""
+        """PATCH 4: core.execution.reconciliation was deleted; new reconciler is at core.state.reconciler."""
         import warnings
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
             import importlib
-            import core.execution.reconciliation
-            importlib.reload(core.execution.reconciliation)
+            # PATCH 4: reconciler moved to core.state.reconciler
+            import core.state.reconciler
+            importlib.reload(core.state.reconciler)
             deprecation_warnings = [
                 x for x in w
                 if "deprecat" in str(x.message).lower()
-                and "reconciliation" in str(x.filename).lower()
+                and "reconcil" in str(x.filename).lower()
             ]
             assert deprecation_warnings == [], (
-                f"reconciliation.py emits deprecation warnings at import: {deprecation_warnings}"
+                f"reconciler.py emits deprecation warnings at import: {deprecation_warnings}"
             )
 
 
