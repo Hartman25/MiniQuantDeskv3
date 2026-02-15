@@ -290,13 +290,22 @@ def _is_exit_signal(sig: dict) -> bool:
     return False
 
 
-def _try_recovery(broker, position_store, order_machine, state_dir: Optional[Path] = None) -> RecoveryStatus:
+def _try_recovery(
+    broker,
+    position_store,
+    order_machine,
+    state_dir: Optional[Path] = None,
+    *,
+    paper_mode: bool = True,
+) -> RecoveryStatus:
     """
-    P1 Patch 7: Attempt crash-recovery via RecoveryCoordinator.
+    P1 Patch 7 + PATCH 4: Attempt crash-recovery via RecoveryCoordinator.
 
     Returns RecoveryStatus. If FAILED, the caller should halt.
-    On any internal exception, returns REBUILT (fail-open so the
-    loop can still start).
+
+    Fail-mode:
+      - Paper: On internal exception returns REBUILT (fail-open).
+      - Live:  On internal exception returns FAILED (fail-closed).
     """
     try:
         sdir = state_dir or Path(os.getenv("STATE_DIR", "data/state"))
@@ -306,6 +315,7 @@ def _try_recovery(broker, position_store, order_machine, state_dir: Optional[Pat
             broker=broker,
             position_store=position_store,
             order_machine=order_machine,
+            paper_mode=paper_mode,
         )
         report = coord.recover()
         logger.info(
@@ -316,8 +326,12 @@ def _try_recovery(broker, position_store, order_machine, state_dir: Optional[Pat
         )
         return report.status
     except Exception:
-        logger.warning("Recovery coordinator raised; continuing with REBUILT", exc_info=True)
-        return RecoveryStatus.REBUILT
+        if paper_mode:
+            logger.warning("Recovery coordinator raised; continuing with REBUILT (paper)", exc_info=True)
+            return RecoveryStatus.REBUILT
+        else:
+            logger.error("Recovery coordinator raised in LIVE mode; returning FAILED", exc_info=True)
+            return RecoveryStatus.FAILED
 
 
 def _load_protective_stops_from_broker(broker) -> Dict[str, str]:
@@ -779,7 +793,7 @@ def run(opts: RunOptions) -> int:
         # P1 Patch 7: Recovery coordinator – reconstruct state on startup
         # ===============================================================
         _order_machine = getattr(exec_engine, "state_machine", None) if exec_engine else None
-        recovery_status = _try_recovery(broker, position_store, _order_machine)
+        recovery_status = _try_recovery(broker, position_store, _order_machine, paper_mode=paper)
         if recovery_status == RecoveryStatus.FAILED:
             logger.error("RECOVERY FAILED – halting runtime for safety")
             return 1
