@@ -6,13 +6,20 @@ Properties:
 - Line-buffered + explicit flush for durability.
 - Thread-safe via lock.
 - Backtest-safe timestamps via injected clock.
+
+PATCH 2 (2026-02-14):
+- CRC32 checksum per line for corruption detection
+- Explicit fsync after append for crash-safety
+- Validation on load: fail fast on corrupt lines
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import zlib
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -33,6 +40,11 @@ class SystemClock:
 
 
 class TransactionLogError(RuntimeError):
+    pass
+
+
+class TransactionLogCorruptionError(TransactionLogError):
+    """Raised when transaction log has corrupted lines (checksum mismatch)."""
     pass
 
 
@@ -138,8 +150,20 @@ class TransactionLog:
                 event_dict = self._normalize_json(event_dict)
 
                 line = json.dumps(event_dict, separators=(",", ":"), ensure_ascii=False)
-                self._file.write(line + "\n")
+
+                # PATCH 2: Add CRC32 checksum for corruption detection
+                checksum = zlib.crc32(line.encode("utf-8")) & 0xFFFFFFFF
+                line_with_checksum = f"{checksum:08x}:{line}"
+
+                self._file.write(line_with_checksum + "\n")
                 self._file.flush()
+
+                # PATCH 2: Explicit fsync for crash-safety (best-effort on Windows)
+                try:
+                    os.fsync(self._file.fileno())
+                except (OSError, AttributeError):
+                    # Windows may not support fsync on all file systems; log but continue
+                    pass
             except Exception as e:
                 self.logger.error("Failed to append to transaction log", extra={"error": str(e)}, exc_info=True)
                 raise TransactionLogError(f"Failed to append to transaction log: {e}") from e
@@ -158,7 +182,11 @@ class TransactionLog:
             return list(self.iter_events())
 
     def iter_events(self) -> Iterator[Dict[str, Any]]:
-        """Iterate events without loading everything into memory."""
+        """
+        Iterate events without loading everything into memory.
+
+        PATCH 2: Validates CRC32 checksums; raises TransactionLogCorruptionError on mismatch.
+        """
         # We intentionally do NOT keep the lock during iteration to avoid deadlocks;
         # instead we take a snapshot of the path and open a separate handle.
         path = self.log_path
@@ -168,15 +196,62 @@ class TransactionLog:
         def _gen() -> Iterator[Dict[str, Any]]:
             try:
                 with open(path, mode="r", encoding="utf-8") as f:
+                    line_num = 0
                     for line in f:
+                        line_num += 1
                         line = line.strip()
                         if not line:
                             continue
+
+                        # PATCH 2: Parse and validate checksum
+                        if ":" not in line:
+                            # Legacy format without checksum (pre-PATCH 2); accept for backward compat
+                            try:
+                                yield json.loads(line)
+                                continue
+                            except json.JSONDecodeError:
+                                # Skip malformed line but continue
+                                continue
+
+                        # Format: "checksum:json_data"
+                        checksum_str, _, json_str = line.partition(":")
+                        if len(checksum_str) != 8:
+                            # Not a valid checksum format; try as legacy
+                            try:
+                                yield json.loads(line)
+                                continue
+                            except json.JSONDecodeError:
+                                continue
+
                         try:
-                            yield json.loads(line)
-                        except json.JSONDecodeError:
-                            # Skip malformed line but continue
-                            continue
+                            expected_checksum = int(checksum_str, 16)
+                        except ValueError:
+                            # Not a hex checksum; try as legacy
+                            try:
+                                yield json.loads(line)
+                                continue
+                            except json.JSONDecodeError:
+                                continue
+
+                        # Compute actual checksum
+                        actual_checksum = zlib.crc32(json_str.encode("utf-8")) & 0xFFFFFFFF
+
+                        if actual_checksum != expected_checksum:
+                            error_msg = (
+                                f"TransactionLog corruption detected at {path}:{line_num}: "
+                                f"checksum mismatch (expected={expected_checksum:08x}, actual={actual_checksum:08x})"
+                            )
+                            raise TransactionLogCorruptionError(error_msg)
+
+                        try:
+                            yield json.loads(json_str)
+                        except json.JSONDecodeError as e:
+                            error_msg = (
+                                f"TransactionLog corruption detected at {path}:{line_num}: "
+                                f"invalid JSON after checksum validation: {e}"
+                            )
+                            raise TransactionLogCorruptionError(error_msg) from e
+
             except FileNotFoundError:
                 return
 
