@@ -124,28 +124,32 @@ class RecoveryCoordinator:
         broker,
         position_store,
         order_machine,
-        max_state_age_hours: int = 24
+        max_state_age_hours: int = 24,
+        paper_mode: bool = True
     ):
         """
         Initialize recovery coordinator.
-        
+
         Args:
             persistence: State persistence manager
             broker: Broker connector
             position_store: Position store
             order_machine: Order state machine
             max_state_age_hours: Maximum age of state to trust (hours)
+            paper_mode: If True, continue recovery on cancel failures (default: True)
         """
         self.persistence = persistence
         self.broker = broker
         self.position_store = position_store
         self.order_machine = order_machine
         self.max_state_age = timedelta(hours=max_state_age_hours)
-        
+        self.paper_mode = paper_mode
+
         self.logger = get_logger(LogStream.SYSTEM)
-        
+
         self.logger.info("RecoveryCoordinator initialized", extra={
-            "max_state_age_hours": max_state_age_hours
+            "max_state_age_hours": max_state_age_hours,
+            "paper_mode": paper_mode
         })
     
     # ========================================================================
@@ -333,28 +337,31 @@ class RecoveryCoordinator:
     def _recover_from_broker(self) -> RecoveryReport:
         """
         Recover by rebuilding state from broker.
-        
+
+        PATCH 1: Before rebuilding, cancel all open broker orders to prevent
+        ghost orders from remaining live after restart.
+
         Returns:
             RecoveryReport
+
+        Raises:
+            Exception: In live mode, if any order cancellation fails
         """
         self.logger.info("Rebuilding state from broker")
-        
+
+        # PATCH 1: Cancel all open orders before rebuilding
+        orders_cancelled = self._cancel_open_orders()
+
         positions_rebuilt = 0
-        
+
         # Get broker positions
         broker_positions = self._get_broker_positions()
-        
+
         # Rebuild each position
         for symbol, broker_pos in broker_positions.items():
             self._rebuild_position_from_broker(broker_pos)
             positions_rebuilt += 1
-        
-        # Cancel any pending orders (conservative approach)
-        # In production, you might want to preserve them
-        broker_orders = self._get_broker_orders()
-        orders_cancelled = len([o for o in broker_orders.values() 
-                               if o.status in ["new", "partially_filled", "accepted"]])
-        
+
         return RecoveryReport(
             status=RecoveryStatus.REBUILT,
             recovered_state=None,
@@ -444,9 +451,110 @@ class RecoveryCoordinator:
             )
     
     # ========================================================================
+    # ORDER CANCELLATION (PATCH 1)
+    # ========================================================================
+
+    def _cancel_open_orders(self) -> int:
+        """
+        Cancel all open broker orders before rebuilding state.
+
+        PATCH 1: Prevents ghost orders from remaining live after restart.
+
+        Returns:
+            Number of orders successfully cancelled
+
+        Raises:
+            Exception: In live mode, if any cancellation fails
+        """
+        try:
+            # Fetch all open orders from broker
+            broker_orders = self.broker.get_orders(status="open")
+
+            if not broker_orders:
+                self.logger.info("No open orders to cancel")
+                return 0
+
+            # Filter to working orders only
+            working_statuses = {"new", "accepted", "pending_new", "partially_filled", "held"}
+            working_orders = [
+                order for order in broker_orders
+                if order.status.lower() in working_statuses
+            ]
+
+            self.logger.info(
+                f"Cancelling open orders: {len(working_orders)} found, {len(broker_orders)} total open",
+                extra={
+                    "working_orders": len(working_orders),
+                    "total_open_orders": len(broker_orders)
+                }
+            )
+
+            cancelled_count = 0
+            failed_cancellations = []
+
+            for order in working_orders:
+                try:
+                    success = self.broker.cancel_order(order.id)
+                    if success:
+                        cancelled_count += 1
+                        self.logger.info(
+                            f"Cancelled order: {order.id}",
+                            extra={
+                                "order_id": order.id,
+                                "symbol": order.symbol,
+                                "status": order.status
+                            }
+                        )
+                    else:
+                        self.logger.info(
+                            f"Order not cancelable: {order.id}",
+                            extra={"order_id": order.id, "status": order.status}
+                        )
+
+                except Exception as e:
+                    failed_cancellations.append((order.id, str(e)))
+                    self.logger.warning(
+                        f"Failed to cancel order: {order.id}",
+                        extra={
+                            "order_id": order.id,
+                            "error": str(e),
+                            "symbol": order.symbol
+                        }
+                    )
+
+            # In live mode, halt if any cancellations failed
+            if failed_cancellations and not self.paper_mode:
+                error_msg = (
+                    f"Recovery halted: {len(failed_cancellations)} order cancellation(s) failed in live mode. "
+                    f"Failed orders: {[oid for oid, _ in failed_cancellations]}"
+                )
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            # In paper mode, log failures but continue
+            if failed_cancellations and self.paper_mode:
+                self.logger.warning(
+                    f"Continuing recovery despite {len(failed_cancellations)} failed cancellations (paper mode)",
+                    extra={"failed_count": len(failed_cancellations)}
+                )
+
+            return cancelled_count
+
+        except Exception as e:
+            self.logger.error(
+                "Failed to cancel open orders",
+                extra={"error": str(e)},
+                exc_info=True
+            )
+            # Re-raise in live mode, absorb in paper mode
+            if not self.paper_mode:
+                raise
+            return 0
+
+    # ========================================================================
     # BROKER QUERY HELPERS
     # ========================================================================
-    
+
     def _get_broker_positions(self) -> Dict[str, Any]:
         """Get current positions from broker."""
         try:
