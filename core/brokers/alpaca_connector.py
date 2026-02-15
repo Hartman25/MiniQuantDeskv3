@@ -64,6 +64,7 @@ class AlpacaBrokerConnector:
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 1.0
     RETRY_BACKOFF_MULTIPLIER = 2.0
+    RETRY_TIMEOUT_SECONDS = 30.0  # PATCH 11: Absolute timeout for all retries
 
     # Network-level errors that are always safe to retry (transient by nature).
     # NOTE: CLASS attribute so tests/mocks don't break if constructed oddly.
@@ -425,14 +426,30 @@ class AlpacaBrokerConnector:
         Retries on:
           - HTTP 429 (rate limit) and 5xx (server errors) via APIError
           - ConnectionError / TimeoutError / OSError (transient network errors)
+
+        PATCH 11: Enforces absolute timeout to prevent indefinite retries.
         """
         max_retries = int(max_retries or self.MAX_RETRIES)
         delay = float(self.RETRY_DELAY_SECONDS)
+        timeout = float(self.RETRY_TIMEOUT_SECONDS)
+
+        # PATCH 11: Track absolute timeout
+        start_time = time.time()
 
         # Pull from class attribute so instances/mocks never "lose" it.
         retryable_net = getattr(type(self), "_RETRYABLE_NETWORK_ERRORS", (ConnectionError, TimeoutError, OSError))
 
         for attempt in range(max_retries):
+            # PATCH 11: Check absolute timeout before retry
+            if attempt > 0:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    self.logger.warning(
+                        "Retry timeout exceeded: %0.2fs >= %0.2fs (attempt %d/%d)",
+                        elapsed, timeout, attempt + 1, max_retries,
+                    )
+                    raise TimeoutError(f"Retry timeout exceeded after {elapsed:.2f}s")
+
             try:
                 return func()
 
