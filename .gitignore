@@ -129,9 +129,16 @@ debug_test.py
 patch_conftest.py
 temp_patch_conftest.py
 
-# Claude worktrees
-.claude/worktrees/
+# Claude artifacts (never commit local Claude state)
+.claude/
+.claude-worktrees/
+**/.claude/
+**/.claude-worktrees/
+.claude/settings.local.json
 
+# Windows problematic device file (breaks Compress-Archive)
+nul
+**/nul
 
 # Local scratch diffs
 *_WIP_*.diff
