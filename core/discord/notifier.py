@@ -20,7 +20,7 @@ Based on production alerting patterns.
 
 from typing import Optional, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, UTC, timezone
 from enum import Enum
 import json
 import time
@@ -30,6 +30,7 @@ from collections import deque
 import requests
 
 from core.logging import get_logger, LogStream
+from core.time.clock import local_time_str, utc_now
 
 
 # ============================================================================
@@ -139,7 +140,7 @@ class DiscordNotifier:
             description=f"MiniQuantDesk v{version} is now running",
             fields=[
                 {"name": "Mode", "value": mode, "inline": True},
-                {"name": "Started", "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S HST"), "inline": True}
+                {"name": "Started", "value": local_time_str("%Y-%m-%d %H:%M:%S %Z"), "inline": True}
             ],
             color=0x00FF00  # Green
         )
@@ -152,7 +153,7 @@ class DiscordNotifier:
             title="🛑 System Stopped",
             description=reason,
             fields=[
-                {"name": "Stopped", "value": datetime.now().strftime("%Y-%m-%d %H:%M:%S HST"), "inline": True}
+                {"name": "Stopped", "value": local_time_str("%Y-%m-%d %H:%M:%S %Z"), "inline": True}
             ],
             color=0xFF0000  # Red
         )
@@ -197,7 +198,7 @@ class DiscordNotifier:
             fields=[
                 {"name": "Strategy", "value": strategy, "inline": True},
                 {"name": "Confidence", "value": f"{float(confidence)*100:.1f}%", "inline": True},
-                {"name": "Time", "value": datetime.now().strftime("%H:%M:%S HST"), "inline": True}
+                {"name": "Time", "value": local_time_str("%H:%M:%S %Z"), "inline": True}
             ],
             color=0x00FF00 if signal_type == "LONG" else 0xFF0000
         )
@@ -219,7 +220,7 @@ class DiscordNotifier:
             description=f"{side} {quantity} shares",
             fields=[
                 {"name": "Order ID", "value": order_id[:20], "inline": True},
-                {"name": "Time", "value": datetime.now().strftime("%H:%M:%S HST"), "inline": True}
+                {"name": "Time", "value": local_time_str("%H:%M:%S %Z"), "inline": True}
             ],
             color=0x0000FF
         )
@@ -244,7 +245,7 @@ class DiscordNotifier:
             fields=[
                 {"name": "Value", "value": f"${value:,.2f}", "inline": True},
                 {"name": "Order ID", "value": order_id[:20], "inline": True},
-                {"name": "Time", "value": datetime.now().strftime("%H:%M:%S HST"), "inline": True}
+                {"name": "Time", "value": local_time_str("%H:%M:%S %Z"), "inline": True}
             ],
             color=0x00FF00
         )
@@ -372,7 +373,8 @@ class DiscordNotifier:
             "description": description,
             "color": color,
             "fields": fields,
-            "timestamp": datetime.utcnow().isoformat(),
+            # Discord expects an ISO timestamp. We always send UTC here.
+            "timestamp": utc_now().isoformat(),
             "footer": {"text": f"Priority: {priority.value}"}
         }
         

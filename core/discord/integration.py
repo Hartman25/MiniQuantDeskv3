@@ -11,7 +11,7 @@ FEATURES:
 
 from typing import Optional, Dict
 from decimal import Decimal
-from datetime import datetime, time as datetime_time
+from datetime import datetime, time as datetime_time, timezone
 import threading
 import schedule
 import time
@@ -208,7 +208,7 @@ class DiscordIntegrationManager:
             account_value = Decimal("0")
             
             self.notifier.send_daily_summary(
-                date=datetime.now().strftime("%Y-%m-%d"),
+                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 trades_count=self._daily_trades,
                 pnl=total_pnl,
                 win_rate=win_rate,

@@ -14,7 +14,7 @@ Based on LEAN's RiskManagement architecture.
 
 from typing import Optional, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from enum import Enum
 
@@ -136,7 +136,7 @@ class RiskManager:
         
         # Track daily P&L (resets at midnight)
         self._daily_pnl = Decimal("0")
-        self._daily_reset_time = datetime.now().date()
+        self._daily_reset_time = datetime.now(timezone.utc).date()
         
         self.logger.info("RiskManager initialized", extra={
             "max_position_size": str(self.limits.max_position_size_usd),
@@ -265,7 +265,7 @@ class RiskManager:
     def update_daily_pnl(self, pnl: Decimal):
         """Update daily P&L tracker."""
         # Reset if new day
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         if today > self._daily_reset_time:
             self._daily_pnl = Decimal("0")
             self._daily_reset_time = today

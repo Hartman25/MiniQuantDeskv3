@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Optional, List, Dict, Tuple, Callable, Any
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import os
 import time
 from enum import Enum
@@ -295,7 +295,7 @@ class AlpacaBrokerConnector:
                     symbol=pos.symbol,
                     quantity=Decimal(str(pos.qty)),
                     entry_price=Decimal(str(pos.avg_entry_price)),
-                    entry_time=datetime.utcnow(),
+                    entry_time=datetime.now(UTC),
                     strategy="UNKNOWN",
                     order_id="UNKNOWN",
                     current_price=Decimal(str(pos.current_price)) if getattr(pos, "current_price", None) else None,
@@ -322,8 +322,8 @@ class AlpacaBrokerConnector:
         except Exception as e:
             raise BrokerConnectionError(f"Failed to get account info: {e}") from e
 
-    def get_orders(self, status: str = "open") -> List:
-        """Get orders from broker filtered by status (open/closed/all)."""
+    def get_orders(self, status: str = "open", limit: Optional[int] = None) -> List:
+        """Get orders from broker filtered by status (open/closed/all). Optionally limit results."""
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -333,13 +333,24 @@ class AlpacaBrokerConnector:
                 "closed": QueryOrderStatus.CLOSED,
                 "all": QueryOrderStatus.ALL,
             }
-            alpaca_status = status_map.get(status.lower(), QueryOrderStatus.OPEN)
+            alpaca_status = status_map.get((status or "open").lower(), QueryOrderStatus.OPEN)
 
-            request = GetOrdersRequest(status=alpaca_status)
+            # Alpaca supports limit on the request; keep it optional.
+            if limit is not None:
+                request = GetOrdersRequest(status=alpaca_status, limit=int(limit))
+            else:
+                request = GetOrdersRequest(status=alpaca_status)
+
             orders = self._retry_api_call(lambda: self.client.get_orders(request))
 
-            self.logger.debug("Fetched orders", extra={"count": len(orders), "status_filter": status})
-            return orders
+            # Some SDK versions return iterables; normalize to a plain list for stability.
+            orders_list = list(orders)
+
+            self.logger.debug(
+                "Fetched orders",
+                extra={"count": len(orders_list), "status_filter": status, "limit": limit},
+            )
+            return orders_list
 
         except Exception as e:
             raise BrokerConnectionError(f"Failed to get orders: {e}") from e
@@ -358,13 +369,19 @@ class AlpacaBrokerConnector:
         """
         now_mono = time.monotonic()
 
+        # Default cache TTL is 15s unless overridden.
         # Tests may override this directly (e.g. stub._clock_cache_ttl = 0.05).
-        ttl_s = float(getattr(self, "_clock_cache_ttl", 0.0) or 0.0)
+        default_ttl = float(globals().get("MARKET_CLOCK_CACHE_S", 15.0))
+        ttl_raw = getattr(self, "_clock_cache_ttl", None)
+        ttl_s = float(default_ttl if ttl_raw is None else ttl_raw)
 
-        if self._clock_cache is not None and ttl_s > 0:
-            age_s = now_mono - float(getattr(self, "_clock_cache_ts", 0.0) or 0.0)
-            if 0 <= age_s < ttl_s:
-                return self._clock_cache
+        cache = getattr(self, "_clock_cache", None)
+        cache_ts = getattr(self, "_clock_cache_ts", None)
+
+        if cache is not None and ttl_s > 0 and cache_ts is not None:
+            age_s = now_mono - float(cache_ts)
+            if 0.0 <= age_s < ttl_s:
+                return cache
 
         try:
             clock = self._retry_api_call(lambda: self.client.get_clock())

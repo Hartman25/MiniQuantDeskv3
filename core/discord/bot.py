@@ -23,7 +23,7 @@ Based on production command & control patterns.
 
 from typing import Optional, Dict, List, Callable
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, UTC
 import asyncio
 import threading
 
@@ -137,7 +137,7 @@ class TradingBot(commands.Bot):
             embed = discord.Embed(
                 title="📊 System Status",
                 color=0x00FF00 if status.get('running') else 0xFF0000,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             embed.add_field(name="Status", value=status.get('status', 'UNKNOWN'), inline=True)
@@ -167,7 +167,7 @@ class TradingBot(commands.Bot):
             embed = discord.Embed(
                 title="📈 Active Positions",
                 color=0x0099FF,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             for pos in positions[:10]:  # Limit to 10
@@ -197,7 +197,7 @@ class TradingBot(commands.Bot):
             embed = discord.Embed(
                 title="💰 Today's P&L",
                 color=0x00FF00 if pnl_data.get('total', 0) > 0 else 0xFF0000,
-                timestamp=datetime.utcnow()
+                timestamp=datetime.now(UTC)
             )
             
             embed.add_field(name="Total P&L", value=f"${pnl_data.get('total', 0):,.2f}", inline=True)

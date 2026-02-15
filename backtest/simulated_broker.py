@@ -17,7 +17,7 @@ Matches live broker interface.
 
 from typing import Dict, List, Optional
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 import uuid
 
@@ -155,7 +155,7 @@ class SimulatedBroker:
             quantity=quantity,
             limit_price=limit_price,
             stop_price=stop_price,
-            created_at=datetime.now()
+            created_at=datetime.now(timezone.utc)
         )
         
         self.pending_orders[order_id] = order

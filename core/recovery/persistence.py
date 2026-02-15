@@ -34,6 +34,7 @@ import json
 import hashlib
 import shutil
 from threading import Lock
+import time
 
 from core.logging import get_logger, LogStream
 
@@ -504,7 +505,7 @@ class StatePersistence:
             return None
         
         mtime = self.current_state_file.stat().st_mtime
-        return datetime.now().timestamp() - mtime
+        return time.time() - mtime
     
     def has_saved_state(self) -> bool:
         """Check if saved state exists."""
