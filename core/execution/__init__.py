@@ -1,5 +1,8 @@
 """
-Order execution engine and position reconciliation.
+Order execution engine.
+
+PATCH 4 (2026-02-14): Removed deprecated reconciliation module.
+Active reconciler is now at: core.state.reconciler
 """
 
 from .engine import (
@@ -7,16 +10,7 @@ from .engine import (
     OrderExecutionError,
 )
 
-from .reconciliation import (
-    PositionReconciliation,
-    ReconciliationResult,
-    ReconciliationError,
-)
-
 __all__ = [
     "OrderExecutionEngine",
     "OrderExecutionError",
-    "PositionReconciliation",
-    "ReconciliationResult",
-    "ReconciliationError",
 ]
