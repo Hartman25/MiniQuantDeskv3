@@ -11,6 +11,7 @@ import pytest
 import threading
 import atexit
 import time
+from pathlib import Path
 from core.config.env import load_env
 # tests/conftest.py
 
@@ -22,7 +23,54 @@ collect_ignore = []
 # -------------------------
 # Fakes used by integration tests
 # -------------------------
+def pytest_addoption(parser):
+    parser.addoption(
+        "--allow-broker-writes",
+        action="store_true",
+        default=False,
+        help="Allow acceptance tests to submit/cancel paper orders (DANGEROUS).",
+    )
 
+def pytest_collection_modifyitems(config, items):
+    """
+    When broker writes are not explicitly allowed, skip tests that must
+    submit/cancel real paper orders.
+    """
+    allow = config.getoption("--allow-broker-writes")
+    if allow:
+        return
+
+    skip_write = pytest.mark.skip(reason="Broker writes disabled. Run with --allow-broker-writes to enable.")
+
+    # Add nodeid patterns here as you discover more broker-write tests.
+    write_patterns = (
+        "tests/acceptance/test_paper_truth.py::TestPaperTruth::test_limit_order_ttl_cancel",
+    )
+
+    for item in items:
+        if any(pat in item.nodeid for pat in write_patterns):
+            item.add_marker(skip_write)
+
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_test_journal_dir():
+    # Keep pytest from polluting runtime journals
+    base = Path("data") / "journal_tests"
+    base.mkdir(parents=True, exist_ok=True)
+    os.environ["JOURNAL_DIR"] = str(base)
+
+@pytest.fixture(scope="session", autouse=True)
+def _safety_switch_for_tests(request):
+    """
+    Default: block ANY broker order placement during tests.
+    To allow paper order submit/cancel acceptance tests, run:
+      pytest -q --allow-broker-writes
+    """
+    allow = request.config.getoption("--allow-broker-writes")
+    if allow:
+        os.environ.pop("MQD_SMOKE_NO_ORDERS", None)
+    else:
+        os.environ["MQD_SMOKE_NO_ORDERS"] = "1"
+ 
 class FakeDataProvider:
     """Return a minimal DataFrame for the runtime loop."""
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int = 1) -> pd.DataFrame:
@@ -479,7 +527,7 @@ def patch_runtime(monkeypatch, tmp_path):
     """
     Run core.runtime.app.run() for exactly one iteration using FakeContainer.
     Returns (container, exec_engine).
-    
+
     Accepts kwargs for test control:
         - force_status: Override wait_for_order return value
         - stale: Force is_order_stale() to return True
@@ -497,7 +545,7 @@ def patch_runtime(monkeypatch, tmp_path):
     ):
         cfg = FakeConfig(symbols=["SPY"], timeframe="1Min")
         container = FakeContainer(cfg=cfg, signals=signals, risk_result=risk_result, position_qty=position_qty)
-        
+
         # Apply test controls to exec engine
         if force_status is not None:
             container.get_execution_engine().force_wait_status = force_status
@@ -517,8 +565,10 @@ def patch_runtime(monkeypatch, tmp_path):
             run_interval_s=60,
             run_once=True,   # <-- critical
         )
+
         # Prevent any real Alpaca network calls
         if hasattr(app_mod, "AlpacaBrokerConnector"):
+
             class _FakeAlpacaBroker:
                 def __init__(self, *args, **kwargs):
                     pass
@@ -529,7 +579,7 @@ def patch_runtime(monkeypatch, tmp_path):
                 # If runtime asks for account/buying power/etc, return safe defaults
                 def get_account_info(self):
                     return {"portfolio_value": "100000", "buying_power": "100000", "cash": "100000"}
-                
+
                 def get_bars(self, symbol: str, timeframe: str, limit: int):
                     # Return minimal DataFrame
                     return pd.DataFrame([{
@@ -540,15 +590,63 @@ def patch_runtime(monkeypatch, tmp_path):
                         "close": 100.0,
                         "volume": 1000,
                     }])
-                
+
                 def get_orders(self):
+                    # RecoveryCoordinator may call this
                     return []
-                
+
+                def get_order_status(self, broker_order_id: str):
+                    # Some code paths try to fall back to broker status
+                    return ("filled", {"filled_qty": "1", "filled_avg_price": "100.0"})
+
                 def get_position(self, symbol: str):
-                    """Return position from container's position store for PATCH 3 compatibility"""
-                    # Query the container's position store
+                    """Return a position from the container's position store (stubbed broker)."""
                     pos_store = container.get_position_store()
-                    return pos_store.get_position(symbol)
+
+                    if hasattr(pos_store, "get_position"):
+                        return pos_store.get_position(symbol)
+                    if hasattr(pos_store, "get"):
+                        return pos_store.get(symbol)
+                    try:
+                        return pos_store[symbol]
+                    except Exception:
+                        return None
+
+                def get_positions(self):
+                    """Return all positions from the container's position store (needed by RecoveryCoordinator)."""
+                    pos_store = container.get_position_store()
+
+                    for attr in ("get_positions", "list_positions", "all"):
+                        if hasattr(pos_store, attr):
+                            try:
+                                res = getattr(pos_store, attr)()
+                                return list(res) if res is not None else []
+                            except Exception:
+                                pass
+
+                    for attr in ("values",):
+                        if hasattr(pos_store, attr):
+                            try:
+                                res = getattr(pos_store, attr)()
+                                return list(res) if res is not None else []
+                            except TypeError:
+                                try:
+                                    res = getattr(pos_store, attr)
+                                    return list(res) if res is not None else []
+                                except Exception:
+                                    pass
+
+                    for attr in ("_positions", "positions"):
+                        if hasattr(pos_store, attr):
+                            try:
+                                res = getattr(pos_store, attr)
+                                if isinstance(res, dict):
+                                    return list(res.values())
+                                return list(res) if res is not None else []
+                            except Exception:
+                                pass
+
+                    return []
 
             monkeypatch.setattr(app_mod, "AlpacaBrokerConnector", _FakeAlpacaBroker)
 
