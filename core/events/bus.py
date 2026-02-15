@@ -159,6 +159,7 @@ class OrderEventBus:
 # Statistics
         self._events_processed = 0
         self._events_failed = 0
+        self._events_dropped = 0  # PATCH 8: track dropped events
         
         self.logger.info("OrderEventBus initialized", extra={
             "max_queue_size": max_queue_size
@@ -197,32 +198,32 @@ class OrderEventBus:
     def emit(self, event: Event):
         """
         Emit event to bus.
-        
+
         Thread-safe. Can be called from any thread.
-        
+        Non-fatal: if the queue is full the event is dropped and the
+        dropped counter is incremented (PATCH 8).
+
         Args:
             event: Event to emit
-            
-        Raises:
-            queue.Full: If queue is full (should never happen with large queue)
-            RuntimeError: If bus is not running
         """
         if not self._running:
             raise RuntimeError("Event bus is not running. Call start() first.")
-        
+
         try:
             # Non-blocking put with timeout
             self._queue.put(event, block=True, timeout=1.0)
-            
+
         except queue.Full:
-            self.logger.error(
-                "Event queue full, dropping event",
+            self._events_dropped += 1
+            self.logger.warning(
+                "Event queue full, dropping event (dropped=%d)",
+                self._events_dropped,
                 extra={
                     "event_type": type(event).__name__,
-                    "queue_size": self._queue.qsize()
-                }
+                    "queue_size": self._queue.qsize(),
+                    "events_dropped": self._events_dropped,
+                },
             )
-            raise
     
     def start(self):
         """
@@ -387,16 +388,17 @@ class OrderEventBus:
     def get_stats(self) -> Dict:
         """
         Get event bus statistics.
-        
+
         Returns:
-            Dict with processed, failed, queue size
+            Dict with processed, failed, dropped, queue size
         """
         return {
             "events_processed": self._events_processed,
             "events_failed": self._events_failed,
+            "events_dropped": self._events_dropped,
             "queue_size": self._queue.qsize(),
             "running": self._running,
-            "registered_event_types": len(self._handlers)
+            "registered_event_types": len(self._handlers),
         }
     
     def __enter__(self):

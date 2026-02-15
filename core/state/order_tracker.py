@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 import logging
+import threading
 
 from core.state.order_machine import OrderStatus
 
@@ -184,19 +185,23 @@ class OrderTracker:
     def __init__(self):
         self._in_flight_orders: Dict[str, InFlightOrder] = {}
         self._completed_orders: Dict[str, InFlightOrder] = {}
-        
+
         # Tracking sets for quick lookups
         self._exchange_id_to_client_id: Dict[str, str] = {}
-        
+
+        # PATCH 7: Thread-safety lock for mutation methods
+        self._lock = threading.Lock()
+
         logger.info("OrderTracker initialized")
     
     def start_tracking(self, order: InFlightOrder):
-        """Begin tracking an order"""
-        self._in_flight_orders[order.client_order_id] = order
-        
-        if order.exchange_order_id:
-            self._exchange_id_to_client_id[order.exchange_order_id] = order.client_order_id
-        
+        """Begin tracking an order (thread-safe)."""
+        with self._lock:
+            self._in_flight_orders[order.client_order_id] = order
+
+            if order.exchange_order_id:
+                self._exchange_id_to_client_id[order.exchange_order_id] = order.client_order_id
+
         logger.info(
             f"Started tracking order: {order.client_order_id}",
             extra={
@@ -209,27 +214,28 @@ class OrderTracker:
     
     def stop_tracking(self, client_order_id: str, reason: str = "completed"):
         """
-        Stop tracking an order (move to completed).
-        
+        Stop tracking an order (move to completed).  Thread-safe.
+
         Args:
             client_order_id: Order ID
             reason: Why stopped (completed, cancelled, rejected)
         """
-        if client_order_id not in self._in_flight_orders:
-            logger.warning(f"Tried to stop tracking unknown order: {client_order_id}")
-            return
-        
-        order = self._in_flight_orders[client_order_id]
-        order.mark_completed(reason)
-        
-        # Move to completed
-        self._completed_orders[client_order_id] = order
-        del self._in_flight_orders[client_order_id]
-        
-        # Remove exchange ID mapping
-        if order.exchange_order_id in self._exchange_id_to_client_id:
-            del self._exchange_id_to_client_id[order.exchange_order_id]
-        
+        with self._lock:
+            if client_order_id not in self._in_flight_orders:
+                logger.warning(f"Tried to stop tracking unknown order: {client_order_id}")
+                return
+
+            order = self._in_flight_orders[client_order_id]
+            order.mark_completed(reason)
+
+            # Move to completed
+            self._completed_orders[client_order_id] = order
+            del self._in_flight_orders[client_order_id]
+
+            # Remove exchange ID mapping
+            if order.exchange_order_id in self._exchange_id_to_client_id:
+                del self._exchange_id_to_client_id[order.exchange_order_id]
+
         logger.info(
             f"Stopped tracking order: {client_order_id} ({reason})",
             extra={
@@ -242,71 +248,84 @@ class OrderTracker:
     
     def process_order_update(self, client_order_id: str, update: dict):
         """
-        Process order status update.
-        
+        Process order status update.  Thread-safe.
+
         Args:
             client_order_id: Order ID
             update: Update dict with status, filled_qty, etc
         """
-        if client_order_id not in self._in_flight_orders:
-            logger.warning(
-                f"Received update for unknown order: {client_order_id}",
-                extra={'update': update}
-            )
-            return
-        
-        order = self._in_flight_orders[client_order_id]
-        
-        # Update exchange ID if provided
-        if 'exchange_order_id' in update and update['exchange_order_id']:
-            order.exchange_order_id = update['exchange_order_id']
-            self._exchange_id_to_client_id[update['exchange_order_id']] = client_order_id
-        
-        # Update state
-        if 'status' in update:
-            old_state = order.current_state
-            new_state = OrderStatus(update['status'])
-            order.current_state = new_state
-            
-            if new_state != old_state:
-                logger.info(
-                    f"Order state changed: {client_order_id} {old_state.value} -> {new_state.value}",
-                    extra={'client_order_id': client_order_id, 'old_state': old_state.value, 'new_state': new_state.value}
+        should_stop = False
+        stop_reason = ""
+
+        with self._lock:
+            if client_order_id not in self._in_flight_orders:
+                logger.warning(
+                    f"Received update for unknown order: {client_order_id}",
+                    extra={'update': update}
                 )
-        
-        # Update submitted timestamp
-        if 'submitted_at' in update and not order.submitted_at:
-            order.submitted_at = update['submitted_at']
-        
-        order.last_update_at = datetime.now(timezone.utc)
-        
-        # If done, stop tracking
-        if update.get('status') in ['FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED']:
-            reason = update['status'].lower()
-            self.stop_tracking(client_order_id, reason)
+                return
+
+            order = self._in_flight_orders[client_order_id]
+
+            # Update exchange ID if provided
+            if 'exchange_order_id' in update and update['exchange_order_id']:
+                order.exchange_order_id = update['exchange_order_id']
+                self._exchange_id_to_client_id[update['exchange_order_id']] = client_order_id
+
+            # Update state
+            if 'status' in update:
+                old_state = order.current_state
+                new_state = OrderStatus(update['status'])
+                order.current_state = new_state
+
+                if new_state != old_state:
+                    logger.info(
+                        f"Order state changed: {client_order_id} {old_state.value} -> {new_state.value}",
+                        extra={'client_order_id': client_order_id, 'old_state': old_state.value, 'new_state': new_state.value}
+                    )
+
+            # Update submitted timestamp
+            if 'submitted_at' in update and not order.submitted_at:
+                order.submitted_at = update['submitted_at']
+
+            order.last_update_at = datetime.now(timezone.utc)
+
+            # If done, flag for stop_tracking (outside lock to avoid re-entrant lock)
+            if update.get('status') in ['FILLED', 'CANCELLED', 'REJECTED', 'EXPIRED']:
+                should_stop = True
+                stop_reason = update['status'].lower()
+
+        if should_stop:
+            self.stop_tracking(client_order_id, stop_reason)
     
     def process_fill(self, client_order_id: str, fill: FillEvent):
-        """Process fill event"""
-        if client_order_id not in self._in_flight_orders:
-            logger.warning(f"Received fill for unknown order: {client_order_id}")
-            return
-        
-        order = self._in_flight_orders[client_order_id]
-        order.add_fill(fill)
-        
-        logger.info(
-            f"Fill processed: {client_order_id}",
-            extra={
-                'client_order_id': client_order_id,
-                'fill_qty': str(fill.quantity),
-                'fill_price': str(fill.price),
-                'total_filled': str(order.filled_quantity),
-                'total_qty': str(order.quantity)
-            }
-        )
-        
-        # If fully filled, stop tracking
-        if order.filled_quantity >= order.quantity:
+        """Process fill event.  Thread-safe."""
+        should_stop = False
+
+        with self._lock:
+            if client_order_id not in self._in_flight_orders:
+                logger.warning(f"Received fill for unknown order: {client_order_id}")
+                return
+
+            order = self._in_flight_orders[client_order_id]
+            order.add_fill(fill)
+
+            logger.info(
+                f"Fill processed: {client_order_id}",
+                extra={
+                    'client_order_id': client_order_id,
+                    'fill_qty': str(fill.quantity),
+                    'fill_price': str(fill.price),
+                    'total_filled': str(order.filled_quantity),
+                    'total_qty': str(order.quantity)
+                }
+            )
+
+            # If fully filled, flag for stop_tracking (outside lock)
+            if order.filled_quantity >= order.quantity:
+                should_stop = True
+
+        if should_stop:
             self.stop_tracking(client_order_id, "filled")
     
     def get_in_flight_order(self, client_order_id: str) -> Optional[InFlightOrder]:
