@@ -31,6 +31,7 @@ from core.brokers import AlpacaBrokerConnector, BrokerOrderSide, BrokerConnectio
 from core.runtime.circuit_breaker import ConsecutiveFailureBreaker
 from core.recovery.coordinator import RecoveryCoordinator, RecoveryStatus
 from core.recovery.persistence import StatePersistence
+from core.runtime.state_snapshot import SnapshotHealthMonitor, build_state_snapshot
 from core.data.contract import MarketDataContract
 from core.data.validator import DataValidator, DataValidationError
 from core.data.pipeline import DataPipelineError
@@ -950,6 +951,18 @@ def run(opts: RunOptions) -> int:
         except Exception as e:
             logger.warning(f"Failed to initialize periodic reconciliation: {e}")
 
+        # PATCH 5: Snapshot health monitor — halt LIVE after N consecutive save failures
+        _snapshot_interval_s = int(os.getenv("SNAPSHOT_INTERVAL_S", "30") or "30")
+        _snapshot_max_failures = int(os.getenv("SNAPSHOT_MAX_FAILURES", "3") or "3")
+        _snapshot_monitor = SnapshotHealthMonitor(max_consecutive_failures=_snapshot_max_failures)
+        _snapshot_persistence: Optional[StatePersistence] = None
+        try:
+            _snap_dir = Path(os.getenv("STATE_DIR", "data/state"))
+            _snapshot_persistence = StatePersistence(state_dir=_snap_dir)
+        except Exception as _snap_err:
+            logger.warning("Could not initialize snapshot persistence: %s", _snap_err)
+        _last_snapshot_time = 0.0
+
         cooldown_s = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "30") or "30")
         last_action_ts: Dict[Tuple[str, str, str], float] = {}
 
@@ -1703,6 +1716,33 @@ def run(opts: RunOptions) -> int:
                                 )
                     except Exception as e:
                         logger.error(f"Periodic reconciliation failed: {e}", exc_info=True)
+
+                # PATCH 5: Periodic snapshot save with health monitoring
+                _now_mono = time.monotonic()
+                if _snapshot_persistence and (_now_mono - _last_snapshot_time) >= _snapshot_interval_s:
+                    try:
+                        _snap = build_state_snapshot(
+                            position_store=position_store,
+                            protective_stop_ids=protective_stop_ids,
+                        )
+                        _snapshot_persistence.save_state(_snap)
+                        _snapshot_monitor.record_success()
+                        _last_snapshot_time = _now_mono
+                    except Exception as _snap_exc:
+                        _snapshot_monitor.record_failure()
+                        logger.warning("Snapshot save failed: %s", _snap_exc)
+                        if _snapshot_monitor.is_failed:
+                            if not paper:
+                                logger.error(
+                                    "SNAPSHOT HEALTH CRITICAL: %d consecutive failures in LIVE — halting",
+                                    _snapshot_monitor.consecutive_failures,
+                                )
+                                return 1
+                            else:
+                                logger.warning(
+                                    "Snapshot health degraded in PAPER (%d failures) — continuing",
+                                    _snapshot_monitor.consecutive_failures,
+                                )
 
                 # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()

@@ -210,9 +210,7 @@ class OrderEventBus:
             raise RuntimeError("Event bus is not running. Call start() first.")
 
         try:
-            # Non-blocking put with timeout
-            self._queue.put(event, block=True, timeout=1.0)
-
+            self._queue.put_nowait(event)
         except queue.Full:
             self._events_dropped += 1
             self.logger.warning(

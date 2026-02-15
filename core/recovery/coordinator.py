@@ -307,13 +307,13 @@ class RecoveryCoordinator:
         for order_snapshot in saved_state.pending_orders:
             # Check if order still exists in broker
             broker_order = broker_orders.get(order_snapshot.broker_order_id)
-            
+
             if broker_order and broker_order.status in ["new", "partially_filled", "accepted"]:
-                # Order still pending - restore
+                # Order still pending - log skip (PATCH 3: no fake rehydrate)
                 self._restore_order(order_snapshot)
                 orders_recovered += 1
             else:
-                # Order filled or cancelled while offline
+                # Order filled or cancelled while offline — NOT cancelled by us
                 if broker_order:
                     inconsistencies.append(
                         f"Order {order_snapshot.order_id}: "
@@ -323,7 +323,7 @@ class RecoveryCoordinator:
                     inconsistencies.append(
                         f"Order {order_snapshot.order_id}: no longer exists in broker"
                     )
-                orders_cancelled += 1
+                # Do NOT increment orders_cancelled — we didn't cancel anything
         
         # Determine overall status
         if len(inconsistencies) == 0:
