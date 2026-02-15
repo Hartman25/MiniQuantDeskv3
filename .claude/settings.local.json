@@ -7,7 +7,10 @@
       "Bash(git add:*)",
       "Bash(git commit:*)",
       "Bash(python:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(if [ -f nul ])",
+      "Bash(then rm nul)",
+      "Bash(fi)"
     ]
   }
 }

@@ -443,19 +443,11 @@ class OrderExecutionEngine:
                 raise DuplicateOrderError(error_msg)
 
             try:
-                # Validate and round order using symbol properties (if available)
+                # PATCH 10: Round BEFORE validation and metadata storage
                 if self.symbol_properties:
                     props = self.symbol_properties.get(symbol)
                     if props:
-                        is_valid, reason = props.validate_order(
-                            quantity=int(quantity),
-                            price=None,
-                            side=side.value,
-                        )
-                        if not is_valid:
-                            raise OrderValidationError(f"Order validation failed: {reason}")
-
-                        # Round quantity to lot size
+                        # Round quantity to lot size FIRST
                         rounded_qty = props.round_quantity(int(quantity))
                         if rounded_qty != int(quantity):
                             self.logger.warning(
@@ -465,6 +457,15 @@ class OrderExecutionEngine:
                                 props.lot_size,
                             )
                             quantity = Decimal(str(rounded_qty))
+
+                        # THEN validate the rounded quantity
+                        is_valid, reason = props.validate_order(
+                            quantity=int(quantity),
+                            price=None,
+                            side=side.value,
+                        )
+                        if not is_valid:
+                            raise OrderValidationError(f"Order validation failed: {reason}")
 
                 # Store metadata
                 with self._metadata_lock:
@@ -652,17 +653,11 @@ class OrderExecutionEngine:
                 if limit_price is None or limit_price <= 0:
                     raise OrderValidationError(f"limit_price must be positive, got {limit_price}")
 
+                # PATCH 10: Round BEFORE validation
                 if self.symbol_properties:
                     props = self.symbol_properties.get(symbol)
                     if props:
-                        is_valid, reason = props.validate_order(
-                            quantity=int(quantity),
-                            price=float(limit_price),
-                            side=side.value,
-                        )
-                        if not is_valid:
-                            raise OrderValidationError(f"Order validation failed: {reason}")
-
+                        # Round quantity to lot size FIRST
                         rounded_qty = props.round_quantity(int(quantity))
                         if rounded_qty != int(quantity):
                             self.logger.warning(
@@ -672,6 +667,15 @@ class OrderExecutionEngine:
                                 props.lot_size,
                             )
                             quantity = Decimal(str(rounded_qty))
+
+                        # THEN validate the rounded quantity
+                        is_valid, reason = props.validate_order(
+                            quantity=int(quantity),
+                            price=float(limit_price),
+                            side=side.value,
+                        )
+                        if not is_valid:
+                            raise OrderValidationError(f"Order validation failed: {reason}")
 
                 with self._metadata_lock:
                     self._order_metadata[internal_order_id] = {
@@ -850,17 +854,11 @@ class OrderExecutionEngine:
                 if stop_price is None or stop_price <= 0:
                     raise OrderValidationError(f"stop_price must be positive, got {stop_price}")
 
+                # PATCH 10: Round BEFORE validation
                 if self.symbol_properties:
                     props = self.symbol_properties.get(symbol)
                     if props:
-                        is_valid, reason = props.validate_order(
-                            quantity=int(quantity),
-                            price=float(stop_price),
-                            side=side.value,
-                        )
-                        if not is_valid:
-                            raise OrderValidationError(f"Stop order validation failed: {reason}")
-
+                        # Round quantity to lot size FIRST
                         rounded_qty = props.round_quantity(int(quantity))
                         if rounded_qty != int(quantity):
                             self.logger.warning(
@@ -870,6 +868,15 @@ class OrderExecutionEngine:
                                 props.lot_size,
                             )
                             quantity = Decimal(str(rounded_qty))
+
+                        # THEN validate the rounded quantity
+                        is_valid, reason = props.validate_order(
+                            quantity=int(quantity),
+                            price=float(stop_price),
+                            side=side.value,
+                        )
+                        if not is_valid:
+                            raise OrderValidationError(f"Stop order validation failed: {reason}")
 
                 with self._metadata_lock:
                     self._order_metadata[internal_order_id] = {
