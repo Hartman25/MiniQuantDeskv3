@@ -132,3 +132,7 @@ temp_patch_conftest.py
 # Claude worktrees
 .claude/worktrees/
 
+
+# Local scratch diffs
+*_WIP_*.diff
+
