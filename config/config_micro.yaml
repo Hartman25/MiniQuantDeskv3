@@ -46,12 +46,25 @@ broker:
 # MARKET DATA
 # ============================================================================
 data:
-  primary_provider: alpaca
+  primary_provider: "twelvedata"
   fallback_providers:
-    - polygon
-  max_staleness_seconds: 65                # 65s for 1Min bars
+    - "alpaca"
+
+  max_staleness_seconds: 65
+
+  require_complete_bars: true
+  allow_gaps: true
+  gap_tolerance_pct: 5.0
+
   cache_enabled: true
-  cache_dir: data/cache
+  cache_ttl_seconds: 30
+
+  alpaca_feed: "IEX"
+
+  twelvedata:
+    api_key_env: "TWELVEDATA_API_KEY"
+    interval: "1min"
+    outputsize: 500
 
 # ============================================================================
 # STRATEGIES - MICRO ACCOUNT VERSION

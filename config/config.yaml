@@ -1,5 +1,5 @@
 # ============================================================================
-# MiniQuantDesk v2 - MICRO ACCOUNT Configuration
+# MiniQuantDesk v3 - ACCOUNT Configuration
 # ============================================================================
 # Optimized for $1,000-$1,500 accounts (PDT-safe, tight risk management)
 #
@@ -46,12 +46,35 @@ broker:
 # MARKET DATA
 # ============================================================================
 data:
-  primary_provider: alpaca
+  # Phase 1 goal: get clean 1-min closed bars reliably.
+  # TwelveData is primary (uses TWELVEDATA_API_KEY from env).
+  # Alpaca is fallback (force IEX via env: ALPACA_DATA_FEED=IEX).
+
+  primary_provider: "twelvedata"
   fallback_providers:
-    - polygon
-  max_staleness_seconds: 65                # 65s for 1Min bars
+    - "alpaca"
+
+  # Must be <= 300 due to ConfigSchema validation.
+  # If TwelveData is truly real-time you can tighten this back to ~65.
+  max_staleness_seconds: 65
+
+  # Validator / pipeline behavior controls (your code uses these patterns)
+  require_complete_bars: true
+  allow_gaps: true
+  gap_tolerance_pct: 5.0
+
+  # Cache behavior (pipeline uses TTL semantics; safe to keep here)
   cache_enabled: true
-  cache_dir: data/cache
+  cache_ttl_seconds: 30
+
+  # Documentation-only (actual feed selection is via env ALPACA_DATA_FEED)
+  alpaca_feed: "IEX"
+
+  # TwelveData wiring expectations (pipeline reads TWELVEDATA_API_KEY from env)
+  twelvedata:
+    api_key_env: "TWELVEDATA_API_KEY"
+    interval: "1min"
+    outputsize: 500
 
 # ============================================================================
 # STRATEGIES - MICRO ACCOUNT VERSION
