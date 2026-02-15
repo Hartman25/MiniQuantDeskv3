@@ -359,6 +359,9 @@ class AlpacaBrokerConnector:
         Results are cached for MARKET_CLOCK_CACHE_S seconds (default 15)
         to avoid hammering /v2/clock on every cycle/signal.
 
+        PATCH 8 (2026-02-14): Cache is invalidated when crossing next_open or next_close boundaries
+        to prevent stale market state during transitions.
+
         Returns a dict with keys:
             is_open (bool), timestamp (datetime|None), next_open (datetime|None),
             next_close (datetime|None).
@@ -366,6 +369,7 @@ class AlpacaBrokerConnector:
         Raises BrokerConnectionError on failure.
         """
         now_mono = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
 
         # Default cache TTL is 15s unless overridden.
         # Tests may override this directly (e.g. stub._clock_cache_ttl = 0.05).
@@ -378,7 +382,25 @@ class AlpacaBrokerConnector:
 
         if cache is not None and ttl_s > 0 and cache_ts is not None:
             age_s = now_mono - float(cache_ts)
-            if 0.0 <= age_s < ttl_s:
+
+            # PATCH 8: Invalidate cache if we've crossed next_open or next_close boundary
+            cache_valid_by_age = 0.0 <= age_s < ttl_s
+            cache_valid_by_boundary = True
+
+            if cache_valid_by_age:
+                # Check if we've crossed a market state boundary
+                next_open = cache.get("next_open")
+                next_close = cache.get("next_close")
+
+                # If we have a next_open and current time is past it, invalidate
+                if next_open and now_utc >= next_open:
+                    cache_valid_by_boundary = False
+
+                # If we have a next_close and current time is past it, invalidate
+                if next_close and now_utc >= next_close:
+                    cache_valid_by_boundary = False
+
+            if cache_valid_by_age and cache_valid_by_boundary:
                 return cache
 
         try:
