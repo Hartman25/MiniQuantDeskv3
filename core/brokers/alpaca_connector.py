@@ -86,7 +86,8 @@ class AlpacaBrokerConnector:
             paper=paper
         )
 
-        self._order_id_map: Dict[str, str] = {}
+        # PATCH 5: Removed broker-side _order_id_map.
+        # OrderExecutionEngine owns the internal<->broker mapping.
 
         # Clock TTL cache — avoid hammering /v2/clock every cycle.
         # Use monotonic seconds consistently (tests rely on time.sleep()).
@@ -148,7 +149,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Order submitted", extra={
                     "broker_order_id": broker_order_id,
@@ -194,7 +194,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Limit order submitted", extra={
                     "broker_order_id": broker_order_id,
@@ -240,7 +239,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Stop order submitted", extra={
                     "broker_order_id": broker_order_id,
