@@ -5,7 +5,9 @@
       "Bash(python -m pytest -q)",
       "Bash(python -m pytest:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(python:*)",
+      "Bash(grep:*)"
     ]
   }
 }
