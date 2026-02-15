@@ -87,20 +87,33 @@ class RecoveryReport:
 class RecoveryCoordinator:
     """
     System recovery coordinator.
-    
+
+    AUTHORITATIVE STATE CONTRACT (PATCH 10):
+        Truth priority for state recovery:
+          1. Broker truth   — always preferred when broker is reachable.
+          2. Snapshot state  — used when broker data is unavailable but a
+             valid, non-stale snapshot exists on disk.
+          3. Local ephemeral — transaction log / in-memory state used only
+             as supplementary context; never overrides broker or snapshot.
+
+        Fail-mode:
+          - LIVE:  If broker is unreachable and no valid snapshot exists,
+                   recovery returns FAILED and the runtime must halt.
+          - PAPER: Recovery may continue in degraded mode (REBUILT).
+
     RESPONSIBILITIES:
     - Load persisted state on startup
     - Validate state against broker
     - Reconstruct positions from broker if needed
     - Handle pending orders after restart
     - Generate recovery report
-    
+
     RECOVERY STRATEGIES:
-    1. Happy path: Load state, validate, resume
+    1. Happy path: Load state, validate against broker, resume
     2. Stale state: Load state, reconcile with broker, resume
     3. Corrupted state: Discard, rebuild from broker
     4. No state: Fresh start, load from broker
-    
+
     USAGE:
         coordinator = RecoveryCoordinator(
             persistence=state_persistence,
@@ -108,10 +121,10 @@ class RecoveryCoordinator:
             position_store=position_store,
             order_machine=order_machine
         )
-        
+
         # On startup
         report = coordinator.recover()
-        
+
         if report.status == RecoveryStatus.SUCCESS:
             logger.info("Recovery successful")
         else:
@@ -433,22 +446,27 @@ class RecoveryCoordinator:
             )
     
     def _restore_order(self, order_snapshot: OrderSnapshot):
-        """Restore pending order from snapshot."""
-        try:
-            # Recreate order in order machine
-            # This is application-specific - adjust to your order machine API
-            self.logger.info(f"Restored order: {order_snapshot.order_id}", extra={
+        """Log that order restore was skipped.
+
+        PATCH 3: Paper mode uses cancel+rebuild, so we do NOT pretend to
+        reinsert orders into OrderTracker/OrderStateMachine.  The old code
+        logged "Restored order" without actually rehydrating state — that
+        was misleading and could cause duplicates or missed cancels.
+
+        Live mode should never reach here because open orders are cancelled
+        during recovery; if it does, the coordinator will already have
+        returned FAILED before this point.
+        """
+        self.logger.info(
+            "Skipped order rehydrate: paper mode uses cancel+rebuild; "
+            "order not inserted into tracker",
+            extra={
                 "order_id": order_snapshot.order_id,
                 "symbol": order_snapshot.symbol,
-                "status": order_snapshot.status
-            })
-            
-        except Exception as e:
-            self.logger.error(
-                f"Failed to restore order: {order_snapshot.order_id}",
-                extra={"error": str(e)},
-                exc_info=True
-            )
+                "status": order_snapshot.status,
+                "reason": "no_real_rehydration_available",
+            },
+        )
     
     # ========================================================================
     # ORDER CANCELLATION (PATCH 1)
