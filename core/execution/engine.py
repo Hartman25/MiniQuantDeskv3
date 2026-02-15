@@ -101,6 +101,9 @@ class OrderExecutionEngine:
         # Duplicate order prevention (engine-level defense)
         self._submitted_order_ids: set[str] = set()
 
+        # PATCH 3: Track cumulative filled quantity for partial fills
+        self._cumulative_filled_qty: Dict[str, Decimal] = {}
+
         # Seed duplicate-order guard from persistent transaction log after restart.
         if transaction_log is not None:
             self._seed_submitted_ids_from_log(transaction_log)
@@ -1154,7 +1157,12 @@ class OrderExecutionEngine:
         to_state: OrderStatus,
         fill_info: Optional[Dict[str, Any]],
     ) -> None:
-        """Handle order status change."""
+        """
+        Handle order status change.
+
+        PATCH 3: Support partial fills by tracking cumulative filled_qty
+        and updating positions incrementally.
+        """
         filled_qty = None
         fill_price = None
 
@@ -1171,77 +1179,96 @@ class OrderExecutionEngine:
             fill_price=fill_price,
         )
 
-        # Process fill in OrderTracker (only on FILLED in current design)
-        if to_state == OrderStatus.FILLED and self.order_tracker and filled_qty and fill_price:
-            fill_event = FillEvent(
-                timestamp=datetime.now(timezone.utc),
-                quantity=filled_qty,
-                price=fill_price,
-                commission=Decimal("0"),
-                fill_id=None,
-            )
-            self.order_tracker.process_fill(internal_order_id, fill_event)
+        # PATCH 3: Handle both PARTIALLY_FILLED and FILLED states
+        is_fill_event = to_state in (OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED)
 
-        # durable transaction log fill + trade journal fill
-        if to_state == OrderStatus.FILLED and filled_qty and fill_price:
-            ids = self._trade_ids(internal_order_id)
-            fill_symbol = self._order_metadata.get(internal_order_id, {}).get("symbol")
+        if is_fill_event and filled_qty and fill_price:
+            # Calculate incremental fill quantity
+            previous_filled = self._cumulative_filled_qty.get(internal_order_id, Decimal("0"))
+            incremental_qty = filled_qty - previous_filled
 
-            if self.transaction_log is not None:
-                try:
-                    self.transaction_log.append(
-                        {
-                            "event_type": "ORDER_FILLED",
-                            "run_id": ids.run_id,
-                            "trade_id": ids.trade_id,
-                            "internal_order_id": internal_order_id,
-                            "broker_order_id": broker_order_id,
-                            "symbol": fill_symbol,
-                            "filled_qty": str(filled_qty),
-                            "fill_price": str(fill_price),
-                        }
+            if incremental_qty > 0:
+                # Update cumulative tracker
+                self._cumulative_filled_qty[internal_order_id] = filled_qty
+
+                # Process fill in OrderTracker
+                if self.order_tracker:
+                    fill_event = FillEvent(
+                        timestamp=datetime.now(timezone.utc),
+                        quantity=incremental_qty,
+                        price=fill_price,
+                        commission=Decimal("0"),
+                        fill_id=None,
                     )
-                except Exception:
-                    pass
+                    self.order_tracker.process_fill(internal_order_id, fill_event)
 
-            self._j_emit(
-                build_trade_event(
-                    event_type="ORDER_FILLED",
-                    ids=ids,
-                    internal_order_id=internal_order_id,
-                    broker_order_id=broker_order_id,
-                    symbol=fill_symbol,
-                    qty=str(filled_qty),
-                    reason={"fill_price": str(fill_price)},
-                )
-            )
+                # durable transaction log fill + trade journal fill
+                ids = self._trade_ids(internal_order_id)
+                fill_symbol = self._order_metadata.get(internal_order_id, {}).get("symbol")
 
-        # If filled, create/update position
-        if to_state == OrderStatus.FILLED and filled_qty and fill_price:
-            self._create_position(internal_order_id, filled_qty, fill_price)
+                event_type = "ORDER_PARTIALLY_FILLED" if to_state == OrderStatus.PARTIALLY_FILLED else "ORDER_FILLED"
 
-            # PATCH 1: If this is a protective leg, cancel sibling (OCO) on fill
-            if self._is_protective_internal_id(internal_order_id):
-                self._maybe_cancel_oco_sibling_on_fill(
-                    internal_order_id=internal_order_id,
-                    reason="oco_peer_filled",
-                )
+                if self.transaction_log is not None:
+                    try:
+                        self.transaction_log.append(
+                            {
+                                "event_type": event_type,
+                                "run_id": ids.run_id,
+                                "trade_id": ids.trade_id,
+                                "internal_order_id": internal_order_id,
+                                "broker_order_id": broker_order_id,
+                                "symbol": fill_symbol,
+                                "incremental_qty": str(incremental_qty),
+                                "cumulative_filled_qty": str(filled_qty),
+                                "fill_price": str(fill_price),
+                            }
+                        )
+                    except Exception:
+                        pass
 
-            # PATCH 1: If this is a BUY entry fill, ensure protective orders are live at broker
-            with self._metadata_lock:
-                meta = self._order_metadata.get(internal_order_id) or {}
-            if meta and (not self._is_protective_internal_id(internal_order_id)):
-                side = meta.get("side")
-                if side == BrokerOrderSide.BUY:
-                    self._ensure_protective_orders_for_entry(
-                        entry_internal_order_id=internal_order_id,
-                        symbol=meta.get("symbol"),
-                        filled_qty=filled_qty,
-                        entry_fill_price=fill_price,
-                        strategy=str(meta.get("strategy")),
-                        stop_loss=meta.get("stop_loss"),
-                        take_profit=meta.get("take_profit"),
+                self._j_emit(
+                    build_trade_event(
+                        event_type=event_type,
+                        ids=ids,
+                        internal_order_id=internal_order_id,
+                        broker_order_id=broker_order_id,
+                        symbol=fill_symbol,
+                        qty=str(incremental_qty),
+                        reason={"fill_price": str(fill_price), "cumulative_filled": str(filled_qty)},
                     )
+                )
+
+                # Update position with INCREMENTAL quantity
+                self._create_position(internal_order_id, incremental_qty, fill_price)
+
+                # PATCH 1: Handle protective orders ONLY on FINAL fill (not partial)
+                if to_state == OrderStatus.FILLED:
+                    # If this is a protective leg, cancel sibling (OCO) on final fill
+                    if self._is_protective_internal_id(internal_order_id):
+                        self._maybe_cancel_oco_sibling_on_fill(
+                            internal_order_id=internal_order_id,
+                            reason="oco_peer_filled",
+                        )
+
+                    # If this is a BUY entry final fill, ensure protective orders are live at broker
+                    with self._metadata_lock:
+                        meta = self._order_metadata.get(internal_order_id) or {}
+                    if meta and (not self._is_protective_internal_id(internal_order_id)):
+                        side = meta.get("side")
+                        if side == BrokerOrderSide.BUY:
+                            # Use cumulative filled_qty for protective order sizing
+                            self._ensure_protective_orders_for_entry(
+                                entry_internal_order_id=internal_order_id,
+                                symbol=meta.get("symbol"),
+                                filled_qty=filled_qty,  # cumulative total
+                                entry_fill_price=fill_price,
+                                strategy=str(meta.get("strategy")),
+                                stop_loss=meta.get("stop_loss"),
+                                take_profit=meta.get("take_profit"),
+                            )
+
+                    # Clean up cumulative tracker on final fill
+                    self._cumulative_filled_qty.pop(internal_order_id, None)
 
     # ---------------------------------------------------------------------
     # POSITION UPDATES
