@@ -924,6 +924,18 @@ def run(opts: RunOptions) -> int:
         if protective_stop_ids:
             logger.info("Reloaded %d protective stop(s) from broker", len(protective_stop_ids))
 
+        # PATCH 9 (2026-02-14): Set up periodic reconciliation in runtime loop
+        periodic_reconciler = None
+        reconciler_interval_s = float(os.getenv("RECONCILE_INTERVAL_S", "300") or "300")  # Default 5 minutes
+        try:
+            startup_reconciler = container.get_reconciler() if hasattr(container, "get_reconciler") else None
+            if startup_reconciler:
+                from core.state.reconciler import PeriodicReconciler
+                periodic_reconciler = PeriodicReconciler(startup_reconciler, interval_s=reconciler_interval_s)
+                logger.info(f"Periodic reconciliation enabled (interval={reconciler_interval_s}s)")
+        except Exception as e:
+            logger.warning(f"Failed to initialize periodic reconciliation: {e}")
+
         cooldown_s = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "30") or "30")
         last_action_ts: Dict[Tuple[str, str, str], float] = {}
 
@@ -1642,6 +1654,42 @@ def run(opts: RunOptions) -> int:
                             logger.info("Orphan check: No drift detected")
                     except Exception as e:
                         logger.error(f"Orphan check failed: {e}", exc_info=True)
+
+                # PATCH 9 (2026-02-14): Periodic reconciliation check
+                if periodic_reconciler:
+                    try:
+                        reconcile_result = periodic_reconciler.check()
+                        if reconcile_result.ran:
+                            if reconcile_result.discrepancies:
+                                logger.error(
+                                    f"RECONCILIATION DISCREPANCIES: {len(reconcile_result.discrepancies)} found",
+                                    extra={
+                                        "discrepancies": [
+                                            {
+                                                "type": d.type,
+                                                "symbol": d.symbol,
+                                                "local": str(d.local_value),
+                                                "broker": str(d.broker_value),
+                                                "resolution": d.resolution,
+                                            }
+                                            for d in reconcile_result.discrepancies
+                                        ],
+                                        "run_count": periodic_reconciler.run_count,
+                                    },
+                                )
+                                journal.write_event({
+                                    "event": "reconciliation_discrepancies",
+                                    "count": len(reconcile_result.discrepancies),
+                                    "run_id": trade_run_id,
+                                    "ts_utc": _utc_iso(),
+                                })
+                            else:
+                                logger.info(
+                                    f"Periodic reconciliation: No discrepancies (run #{periodic_reconciler.run_count})"
+                                )
+                    except Exception as e:
+                        logger.error(f"Periodic reconciliation failed: {e}", exc_info=True)
+
                 # ✅ success path only: reset breaker after a full successful cycle
                 _circuit_breaker.record_success()
 

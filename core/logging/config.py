@@ -19,7 +19,7 @@ import logging
 import logging.handlers
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, UTC
 import json
 from contextvars import ContextVar
 
@@ -43,7 +43,7 @@ class JSONFormatter(logging.Formatter):
     
     def format(self, record):
         log_data = {
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'timestamp': datetime.now(UTC).isoformat() + 'Z',
             'level': record.levelname,
             'logger': record.name,
             'message': record.getMessage(),
@@ -71,7 +71,7 @@ class HumanReadableFormatter(logging.Formatter):
     
     def format(self, record):
         # Base format
-        timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        timestamp = datetime.now(UTC).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         level = f"{record.levelname:8s}"
         logger = f"{record.name:20s}"
         

@@ -18,7 +18,7 @@ SECURITY:
 
 from typing import Optional, Dict, Callable, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, UTC
 import discord
 from discord.ext import commands
 import asyncio
@@ -96,7 +96,7 @@ class DiscordCommandHandler:
                 embed = discord.Embed(
                     title="📊 System Status",
                     color=0x3498db,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 for key, value in status_data.items():
@@ -123,7 +123,7 @@ class DiscordCommandHandler:
                 embed = discord.Embed(
                     title="📍 Current Positions",
                     color=0x9b59b6,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 for pos in positions_data[:25]:  # Discord limit
@@ -203,7 +203,7 @@ class DiscordCommandHandler:
                 embed = discord.Embed(
                     title="🛡️ Risk Limits",
                     color=0xf39c12,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 for key, value in risk_data.items():
@@ -226,7 +226,7 @@ class DiscordCommandHandler:
                 embed = discord.Embed(
                     title="💰 Account Info",
                     color=0x2ecc71,
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.now(UTC)
                 )
                 
                 for key, value in account_data.items():

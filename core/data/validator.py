@@ -16,6 +16,7 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 import logging
+import os
 
 from core.data.contract import MarketDataContract, MarketDataContractError
 
@@ -75,7 +76,17 @@ class DataValidator:
             f"gap_tolerance={max_gap_tolerance:.1%}, "
             f"require_complete={require_complete_bars})"
         )
-    
+    def _stale_is_allowed(self) -> bool:
+        """
+        Allow stale bars ONLY in paper mode when explicitly permitted.
+        PAPER_TRADING=true enables paper-mode behavior.
+        MQD_ALLOW_STALE_BARS defaults to '1' (allowed). Set to '0' to fail closed.
+        """
+        paper = os.getenv("PAPER_TRADING", "").strip().lower() in ("1", "true", "yes")
+        if not paper:
+            return False
+        return os.getenv("MQD_ALLOW_STALE_BARS", "1").strip().lower() in ("1", "true", "yes")
+
     def validate_bars(
         self,
         bars: List[MarketDataContract],
@@ -114,11 +125,18 @@ class DataValidator:
         latest_bar = bars[-1]
         if latest_bar.is_stale(self.max_staleness_seconds):
             age = latest_bar.age_seconds()
-            raise DataValidationError(
-                f"Latest bar is stale: {latest_bar.symbol} "
-                f"age={age:.1f}s > threshold={self.max_staleness_seconds}s "
-                f"(timestamp={latest_bar.timestamp.isoformat()})"
-            )
+            if self._stale_is_allowed():
+                logger.warning(
+                    f"Latest bar is stale for {latest_bar.symbol} (allowed by policy): "
+                    f"age={age:.1f}s > threshold={self.max_staleness_seconds}s "
+                    f"(timestamp={latest_bar.timestamp.isoformat()})"
+                )
+            else:
+                raise DataValidationError(
+                    f"Latest bar is stale: {latest_bar.symbol} "
+                    f"age={age:.1f}s > threshold={self.max_staleness_seconds}s "
+                    f"(timestamp={latest_bar.timestamp.isoformat()})"
+                )
         
         # **CRITICAL: Check bar completion (anti-lookahead)**
         if self.require_complete_bars and timeframe:
@@ -163,11 +181,11 @@ class DataValidator:
     ) -> None:
         """
         Validate single bar for staleness and completion.
-        
+
         Args:
             bar: Bar to validate
             timeframe: Expected interval (for completion check)
-            
+
         Raises:
             DataValidationError: If bar is stale or incomplete
         """
@@ -175,17 +193,33 @@ class DataValidator:
             raise DataValidationError(
                 f"Expected MarketDataContract, got {type(bar)}"
             )
-        
+
+        # Staleness check (fail-closed in live; optionally allow in paper)
         if bar.is_stale(self.max_staleness_seconds):
             age = bar.age_seconds()
-            raise DataValidationError(
-                f"Bar is stale: {bar.symbol} "
-                f"age={age:.1f}s > threshold={self.max_staleness_seconds}s"
-            )
-        
-        # **CRITICAL: Check bar completion (anti-lookahead)**
+            if self._stale_is_allowed():
+                logger.warning(
+                    f"Bar is stale for {bar.symbol} (allowed by policy): "
+                    f"age={age:.1f}s > threshold={self.max_staleness_seconds}s "
+                    f"(timestamp={bar.timestamp.isoformat()})"
+                )
+            else:
+                raise DataValidationError(
+                    f"Bar is stale: {bar.symbol} "
+                    f"age={age:.1f}s > threshold={self.max_staleness_seconds}s"
+                )
+
+        # CRITICAL: Check bar completion (anti-lookahead)
         if self.require_complete_bars and timeframe:
-            if not bar.is_complete(timeframe):
+            try:
+                complete = bar.is_complete(timeframe)
+            except Exception as e:
+                # Fail closed if completion check itself breaks
+                raise DataValidationError(
+                    f"Completion check failed for {bar.symbol} timeframe={timeframe}: {e}"
+                ) from e
+
+            if not complete:
                 age = bar.age_seconds()
                 raise DataValidationError(
                     f"INCOMPLETE BAR REJECTED: {bar.symbol} @ {bar.timestamp.isoformat()} "

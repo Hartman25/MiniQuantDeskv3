@@ -128,3 +128,11 @@ _archive/
 debug_test.py
 patch_conftest.py
 temp_patch_conftest.py
+
+# Claude worktrees
+.claude/worktrees/
+
+
+# Local scratch diffs
+*_WIP_*.diff
+

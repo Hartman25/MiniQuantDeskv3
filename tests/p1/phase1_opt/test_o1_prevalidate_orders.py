@@ -249,18 +249,21 @@ class TestQuantityRounding:
         assert result is not None
 
     def test_misaligned_quantity_rejected(self):
-        """Quantity not aligned to lot_size → OrderValidationError."""
-        from core.execution.engine import OrderValidationError
-
+        """PATCH 10: Quantity not aligned to lot_size → auto-rounded, not rejected."""
         props = SymbolProperties(symbol="SPY", lot_size=100, min_order_size=100)
         cache = _fake_cache({"SPY": props})
         engine, broker = _make_engine(symbol_properties=cache)
 
-        with pytest.raises(OrderValidationError, match="lot size"):
-            engine.submit_market_order(
-                internal_order_id="ORD-009",
-                symbol="SPY",
-                quantity=Decimal("250"),
-                side=BrokerOrderSide.BUY,
-                strategy="Test",
-            )
+        # PATCH 10: quantity 250 is rounded to 200 (nearest lot)
+        engine.submit_market_order(
+            internal_order_id="ORD-009",
+            symbol="SPY",
+            quantity=Decimal("250"),
+            side=BrokerOrderSide.BUY,
+            strategy="Test",
+        )
+
+        # Verify broker received rounded quantity
+        broker.submit_market_order.assert_called_once()
+        call_kwargs = broker.submit_market_order.call_args.kwargs
+        assert call_kwargs["quantity"] == Decimal("200")

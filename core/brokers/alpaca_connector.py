@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Optional, List, Dict, Tuple, Callable, Any
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 import os
 import time
 from enum import Enum
@@ -64,6 +64,7 @@ class AlpacaBrokerConnector:
     MAX_RETRIES = 3
     RETRY_DELAY_SECONDS = 1.0
     RETRY_BACKOFF_MULTIPLIER = 2.0
+    RETRY_TIMEOUT_SECONDS = 30.0  # PATCH 11: Absolute timeout for all retries
 
     # Network-level errors that are always safe to retry (transient by nature).
     # NOTE: CLASS attribute so tests/mocks don't break if constructed oddly.
@@ -86,7 +87,8 @@ class AlpacaBrokerConnector:
             paper=paper
         )
 
-        self._order_id_map: Dict[str, str] = {}
+        # PATCH 5: Removed broker-side _order_id_map.
+        # OrderExecutionEngine owns the internal<->broker mapping.
 
         # Clock TTL cache — avoid hammering /v2/clock every cycle.
         # Use monotonic seconds consistently (tests rely on time.sleep()).
@@ -148,7 +150,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Order submitted", extra={
                     "broker_order_id": broker_order_id,
@@ -194,7 +195,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Limit order submitted", extra={
                     "broker_order_id": broker_order_id,
@@ -240,7 +240,6 @@ class AlpacaBrokerConnector:
 
                 order = self._retry_api_call(lambda: self.client.submit_order(request))
                 broker_order_id = order.id
-                self._order_id_map[internal_order_id] = broker_order_id
 
                 self.logger.info("Stop order submitted", extra={
                     "broker_order_id": broker_order_id,
@@ -295,7 +294,7 @@ class AlpacaBrokerConnector:
                     symbol=pos.symbol,
                     quantity=Decimal(str(pos.qty)),
                     entry_price=Decimal(str(pos.avg_entry_price)),
-                    entry_time=datetime.utcnow(),
+                    entry_time=datetime.now(UTC),
                     strategy="UNKNOWN",
                     order_id="UNKNOWN",
                     current_price=Decimal(str(pos.current_price)) if getattr(pos, "current_price", None) else None,
@@ -322,8 +321,8 @@ class AlpacaBrokerConnector:
         except Exception as e:
             raise BrokerConnectionError(f"Failed to get account info: {e}") from e
 
-    def get_orders(self, status: str = "open") -> List:
-        """Get orders from broker filtered by status (open/closed/all)."""
+    def get_orders(self, status: str = "open", limit: Optional[int] = None) -> List:
+        """Get orders from broker filtered by status (open/closed/all). Optionally limit results."""
         try:
             from alpaca.trading.requests import GetOrdersRequest
             from alpaca.trading.enums import QueryOrderStatus
@@ -333,13 +332,24 @@ class AlpacaBrokerConnector:
                 "closed": QueryOrderStatus.CLOSED,
                 "all": QueryOrderStatus.ALL,
             }
-            alpaca_status = status_map.get(status.lower(), QueryOrderStatus.OPEN)
+            alpaca_status = status_map.get((status or "open").lower(), QueryOrderStatus.OPEN)
 
-            request = GetOrdersRequest(status=alpaca_status)
+            # Alpaca supports limit on the request; keep it optional.
+            if limit is not None:
+                request = GetOrdersRequest(status=alpaca_status, limit=int(limit))
+            else:
+                request = GetOrdersRequest(status=alpaca_status)
+
             orders = self._retry_api_call(lambda: self.client.get_orders(request))
 
-            self.logger.debug("Fetched orders", extra={"count": len(orders), "status_filter": status})
-            return orders
+            # Some SDK versions return iterables; normalize to a plain list for stability.
+            orders_list = list(orders)
+
+            self.logger.debug(
+                "Fetched orders",
+                extra={"count": len(orders_list), "status_filter": status, "limit": limit},
+            )
+            return orders_list
 
         except Exception as e:
             raise BrokerConnectionError(f"Failed to get orders: {e}") from e
@@ -350,6 +360,9 @@ class AlpacaBrokerConnector:
         Results are cached for MARKET_CLOCK_CACHE_S seconds (default 15)
         to avoid hammering /v2/clock on every cycle/signal.
 
+        PATCH 8 (2026-02-14): Cache is invalidated when crossing next_open or next_close boundaries
+        to prevent stale market state during transitions.
+
         Returns a dict with keys:
             is_open (bool), timestamp (datetime|None), next_open (datetime|None),
             next_close (datetime|None).
@@ -357,14 +370,39 @@ class AlpacaBrokerConnector:
         Raises BrokerConnectionError on failure.
         """
         now_mono = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
 
+        # Default cache TTL is 15s unless overridden.
         # Tests may override this directly (e.g. stub._clock_cache_ttl = 0.05).
-        ttl_s = float(getattr(self, "_clock_cache_ttl", 0.0) or 0.0)
+        default_ttl = float(globals().get("MARKET_CLOCK_CACHE_S", 15.0))
+        ttl_raw = getattr(self, "_clock_cache_ttl", None)
+        ttl_s = float(default_ttl if ttl_raw is None else ttl_raw)
 
-        if self._clock_cache is not None and ttl_s > 0:
-            age_s = now_mono - float(getattr(self, "_clock_cache_ts", 0.0) or 0.0)
-            if 0 <= age_s < ttl_s:
-                return self._clock_cache
+        cache = getattr(self, "_clock_cache", None)
+        cache_ts = getattr(self, "_clock_cache_ts", None)
+
+        if cache is not None and ttl_s > 0 and cache_ts is not None:
+            age_s = now_mono - float(cache_ts)
+
+            # PATCH 8: Invalidate cache if we've crossed next_open or next_close boundary
+            cache_valid_by_age = 0.0 <= age_s < ttl_s
+            cache_valid_by_boundary = True
+
+            if cache_valid_by_age:
+                # Check if we've crossed a market state boundary
+                next_open = cache.get("next_open")
+                next_close = cache.get("next_close")
+
+                # If we have a next_open and current time is past it, invalidate
+                if next_open and now_utc >= next_open:
+                    cache_valid_by_boundary = False
+
+                # If we have a next_close and current time is past it, invalidate
+                if next_close and now_utc >= next_close:
+                    cache_valid_by_boundary = False
+
+            if cache_valid_by_age and cache_valid_by_boundary:
+                return cache
 
         try:
             clock = self._retry_api_call(lambda: self.client.get_clock())
@@ -388,14 +426,30 @@ class AlpacaBrokerConnector:
         Retries on:
           - HTTP 429 (rate limit) and 5xx (server errors) via APIError
           - ConnectionError / TimeoutError / OSError (transient network errors)
+
+        PATCH 11: Enforces absolute timeout to prevent indefinite retries.
         """
         max_retries = int(max_retries or self.MAX_RETRIES)
         delay = float(self.RETRY_DELAY_SECONDS)
+        timeout = float(self.RETRY_TIMEOUT_SECONDS)
+
+        # PATCH 11: Track absolute timeout
+        start_time = time.time()
 
         # Pull from class attribute so instances/mocks never "lose" it.
         retryable_net = getattr(type(self), "_RETRYABLE_NETWORK_ERRORS", (ConnectionError, TimeoutError, OSError))
 
         for attempt in range(max_retries):
+            # PATCH 11: Check absolute timeout before retry
+            if attempt > 0:
+                elapsed = time.time() - start_time
+                if elapsed >= timeout:
+                    self.logger.warning(
+                        "Retry timeout exceeded: %0.2fs >= %0.2fs (attempt %d/%d)",
+                        elapsed, timeout, attempt + 1, max_retries,
+                    )
+                    raise TimeoutError(f"Retry timeout exceeded after {elapsed:.2f}s")
+
             try:
                 return func()
 

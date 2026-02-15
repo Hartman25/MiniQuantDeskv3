@@ -14,7 +14,7 @@ Based on LEAN's RiskManagement architecture.
 
 from typing import Optional, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from enum import Enum
 
@@ -127,16 +127,22 @@ class RiskManager:
     def __init__(
         self,
         position_store: PositionStore,
-        limits: Optional[RiskLimits] = None
+        limits: Optional[RiskLimits] = None,
+        order_tracker=None  # PATCH 7: optional OrderTracker for BP reservation
     ):
-        """Initialize risk manager."""
+        """Initialize risk manager.
+
+        PATCH 7: If order_tracker is provided, reserved buying power from
+        open/in-flight orders is subtracted from available buying power.
+        """
         self.position_store = position_store
         self.limits = limits or RiskLimits()
+        self.order_tracker = order_tracker
         self.logger = get_logger(LogStream.RISK)
         
         # Track daily P&L (resets at midnight)
         self._daily_pnl = Decimal("0")
-        self._daily_reset_time = datetime.now().date()
+        self._daily_reset_time = datetime.now(timezone.utc).date()
         
         self.logger.info("RiskManager initialized", extra={
             "max_position_size": str(self.limits.max_position_size_usd),
@@ -202,12 +208,16 @@ class RiskManager:
                     f"{self.limits.max_position_pct_portfolio*100:.1f}%"
                 )
             
-            # Check 3: Buying power reserve
-            remaining_bp = buying_power - trade_value
+            # Check 3: Buying power reserve (PATCH 7: subtract reserved BP from open orders)
+            reserved_bp = self._calculate_reserved_buying_power()
+            available_bp = buying_power - reserved_bp
+            remaining_bp = available_bp - trade_value
+
             if remaining_bp < self.limits.min_buying_power_reserve:
                 result.add_rejection(
-                    f"Insufficient buying power reserve: ${remaining_bp} < "
-                    f"${self.limits.min_buying_power_reserve}"
+                    f"Insufficient buying power reserve: ${remaining_bp:.2f} < "
+                    f"${self.limits.min_buying_power_reserve} "
+                    f"(buying_power=${buying_power}, reserved=${reserved_bp:.2f}, trade=${trade_value})"
                 )
             
             # Check 4: Portfolio exposure
@@ -265,7 +275,7 @@ class RiskManager:
     def update_daily_pnl(self, pnl: Decimal):
         """Update daily P&L tracker."""
         # Reset if new day
-        today = datetime.now().date()
+        today = datetime.now(timezone.utc).date()
         if today > self._daily_reset_time:
             self._daily_pnl = Decimal("0")
             self._daily_reset_time = today
@@ -279,15 +289,69 @@ class RiskManager:
     def _calculate_exposure(self, positions: List[Position]) -> Decimal:
         """Calculate total portfolio exposure."""
         total = Decimal("0")
-        
+
         for pos in positions:
             if pos.current_price:
                 value = abs(pos.quantity * pos.current_price)
             else:
                 value = abs(pos.quantity * pos.entry_price)
             total += value
-        
+
         return total
+
+    def _calculate_reserved_buying_power(self) -> Decimal:
+        """
+        PATCH 7: Calculate buying power reserved by open/in-flight orders.
+
+        Returns total value of unfilled BUY orders that are reserving buying power.
+        """
+        if not self.order_tracker:
+            return Decimal("0")
+
+        reserved = Decimal("0")
+
+        try:
+            in_flight = self.order_tracker.get_all_in_flight()
+
+            for order in in_flight:
+                # Only BUY orders reserve buying power
+                if order.side.value != "BUY":
+                    continue
+
+                # Calculate unfilled quantity
+                unfilled_qty = order.quantity - (order.filled_quantity or Decimal("0"))
+
+                if unfilled_qty <= 0:
+                    continue
+
+                # Estimate reserved value
+                # For limit orders, use limit price
+                # For market/stop orders, use last known price or conservative estimate
+                if order.price:
+                    estimated_price = order.price
+                elif order.stop_price:
+                    estimated_price = order.stop_price
+                else:
+                    # Market order: we don't have price, skip (conservative)
+                    # In practice, market orders fill quickly so this is acceptable
+                    continue
+
+                reserved += unfilled_qty * estimated_price
+
+            if reserved > 0:
+                self.logger.debug(
+                    "Reserved buying power calculated",
+                    extra={"reserved_bp": str(reserved), "in_flight_orders": len(in_flight)},
+                )
+
+            return reserved
+
+        except Exception as e:
+            self.logger.warning(
+                "Failed to calculate reserved buying power; assuming zero",
+                extra={"error": str(e)},
+            )
+            return Decimal("0")
     
     def _check_daily_drawdown(self, result: RiskCheckResult, account_value: Decimal):
         """Check daily drawdown limits."""

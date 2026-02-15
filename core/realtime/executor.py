@@ -13,7 +13,7 @@ Based on reactive execution pattern.
 
 from typing import Callable, Optional, Dict, List
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timezone
 import threading
 import queue
 import time
@@ -100,7 +100,7 @@ class EventDrivenExecutor:
             "signal": signal,
             "quantity": quantity,
             "price": price,
-            "submitted_at": datetime.now()
+            "submitted_at": datetime.now(timezone.utc)
         })
         
         self.logger.info(f"Signal queued: {signal.symbol}", extra={
@@ -194,7 +194,7 @@ class EventDrivenExecutor:
                 return  # FLAT/HOLD
             
             # Generate order ID
-            internal_order_id = f"ORD_{int(datetime.now().timestamp()*1000)}"
+            internal_order_id = f"ORD_{int(datetime.now(timezone.utc).timestamp()*1000)}"
             
             # Submit order
             broker_order_id = self.execution_engine.submit_market_order(
@@ -214,7 +214,7 @@ class EventDrivenExecutor:
                     "symbol": signal.symbol,
                     "quantity": quantity,
                     "side": side,
-                    "submitted_at": datetime.now()
+                    "submitted_at": datetime.now(timezone.utc)
                 }
             
             # Wait for fill
